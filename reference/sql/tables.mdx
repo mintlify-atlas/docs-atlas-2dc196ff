@@ -1,0 +1,344 @@
+---
+title: "Tables"
+description: "SQL reference for creating and managing basic tables, supertables, and subtables in TDengine, including column and tag operations."
+---
+
+TDengine uses a **one device, one table** model. A **supertable** (stable) defines a schema shared across many **subtables**, each representing one device. Subtables inherit the column schema and add per-device **tag values**.
+
+## CREATE TABLE
+
+Create a basic table (not part of a supertable):
+
+```sql
+CREATE TABLE [IF NOT EXISTS] [db_name.]tb_name (
+  ts        TIMESTAMP,
+  col1      FLOAT,
+  col2      INT,
+  col3      VARCHAR(64)
+) [table_options]
+
+table_options: {
+    COMMENT 'string_value'
+  | SMA(col_name [, col_name] ...)
+  | TTL value
+}
+```
+
+**Rules:**
+- The **first column must be `TIMESTAMP`** and is automatically set as the primary key.
+- A second column can be designated as a composite primary key using `COMPOSITE KEY` (must be integer or `VARCHAR`).
+- Maximum row length: 48 KB (64 KB from v3.0.5.0).
+- Variable-length types (`VARCHAR`, `NCHAR`, `GEOMETRY`) must specify a max size: `VARCHAR(20)`.
+
+**Table options:**
+
+| Option | Description |
+|--------|-------------|
+| `COMMENT` | Table comment, max 1024 bytes. |
+| `SMA(cols...)` | Specify columns for Small Materialized Aggregates (MAX, MIN, SUM pre-computation). |
+| `TTL value` | Time-to-live in days. TDengine auto-deletes the table after this period. `0` = no limit. Range `[0, 2147483647]`. |
+
+**Example:**
+
+```sql
+CREATE TABLE IF NOT EXISTS power.meters_d1001 (
+  ts        TIMESTAMP,
+  current   FLOAT,
+  voltage   INT,
+  phase     FLOAT
+) COMMENT 'Meter d1001' TTL 365;
+```
+
+---
+
+## CREATE STABLE (Supertable)
+
+A supertable defines a shared schema for a group of devices. Subtables are instantiated from the supertable with specific tag values.
+
+```sql
+CREATE STABLE [IF NOT EXISTS] [db_name.]stb_name (
+  ts       TIMESTAMP,
+  col1     FLOAT,
+  col2     INT
+  [, ...]
+) TAGS (
+  tag1     VARCHAR(64),
+  tag2     INT
+  [, ...]
+) [table_options]
+
+table_options: {
+    COMMENT 'string_value'
+  | SMA(col_name [, col_name] ...)
+  | KEEP value
+  | VIRTUAL {0 | 1}
+}
+```
+
+**Constraints:**
+- A supertable must have at least: one timestamp column, one metric column, and one tag column.
+- Maximum **4096 total columns** (metric + tag combined).
+- Maximum **128 tag columns**. Total tag data must not exceed 16 KB.
+- Tag column names must be unique across all columns — metric and tag columns cannot share a name.
+- `JSON` type is only supported for tag columns; arithmetic expressions (e.g., `NOW + 10s`) are not supported for `TIMESTAMP` tag values.
+- Use `VIRTUAL 1` to create a virtual supertable (max 32767 columns, no compression or `COMPOSITE KEY` support).
+
+**Example:**
+
+```sql
+CREATE STABLE IF NOT EXISTS power.meters (
+  ts        TIMESTAMP,
+  current   FLOAT,
+  voltage   INT,
+  phase     FLOAT
+) TAGS (
+  location  VARCHAR(64),
+  groupId   INT
+);
+```
+
+---
+
+## CREATE TABLE ... USING (Create Subtable)
+
+Create one or more subtables using a supertable as a template:
+
+### Single subtable
+
+```sql
+CREATE TABLE [IF NOT EXISTS] tb_name USING stb_name TAGS (tag_val1, ...);
+```
+
+### Specify tag names explicitly
+
+```sql
+CREATE TABLE [IF NOT EXISTS] tb_name USING stb_name (tag_name1, ...) TAGS (tag_val1, ...);
+```
+
+Unspecified tags default to `NULL`.
+
+### Batch creation
+
+```sql
+CREATE TABLE
+  [IF NOT EXISTS] tb1 USING stb_name TAGS ('Beijing', 1)
+  [IF NOT EXISTS] tb2 USING stb_name TAGS ('Shanghai', 2)
+  [IF NOT EXISTS] tb3 USING stb_name TAGS ('Guangzhou', 3);
+```
+
+<Tip>
+Batch-create 1000–3000 subtables per statement for optimal throughput.
+</Tip>
+
+### Create subtables from CSV
+
+```sql
+CREATE TABLE [IF NOT EXISTS] USING [db_name.]stb_name
+  (tbname, tag_name1, tag_name2)
+  FILE '/path/to/devices.csv';
+```
+
+The CSV file must contain no header, with values enclosed in single quotes.
+
+**Example:**
+
+```sql
+CREATE TABLE IF NOT EXISTS power.d1001
+  USING power.meters (location, groupId)
+  TAGS ('Beijing.Chaoyang', 2);
+```
+
+---
+
+## ALTER TABLE (Basic Table)
+
+```sql
+ALTER TABLE [db_name.]tb_name alter_table_clause
+
+alter_table_clause: {
+    ADD COLUMN col_name column_type
+  | DROP COLUMN col_name
+  | MODIFY COLUMN col_name column_type
+  | RENAME COLUMN old_col_name new_col_name
+  | TTL value
+  | COMMENT 'string_value'
+}
+```
+
+| Operation | Syntax | Notes |
+|-----------|--------|-------|
+| Add column | `ADD COLUMN col_name type` | — |
+| Drop column | `DROP COLUMN col_name` | Cannot drop primary key column |
+| Widen column | `MODIFY COLUMN col_name type(length)` | Only for variable-length types; cannot decrease width |
+| Rename column | `RENAME COLUMN old new` | Cannot rename primary key column |
+| Update TTL | `TTL value` | — |
+| Update comment | `COMMENT 'text'` | — |
+
+---
+
+## ALTER STABLE (Supertable)
+
+Supertable schema changes propagate to all subtables automatically.
+
+```sql
+ALTER STABLE [db_name.]stb_name alter_table_clause
+
+alter_table_clause: {
+    ADD COLUMN col_name column_type
+  | DROP COLUMN col_name
+  | MODIFY COLUMN col_name column_type
+  | ADD TAG tag_name tag_type
+  | DROP TAG tag_name
+  | MODIFY TAG tag_name tag_type
+  | RENAME TAG old_tag_name new_tag_name
+  | COMMENT 'string_value'
+  | KEEP value
+}
+```
+
+| Operation | Syntax | Notes |
+|-----------|--------|-------|
+| Add metric column | `ADD COLUMN col_name type` | Propagates to all subtables |
+| Drop metric column | `DROP COLUMN col_name` | Propagates to all subtables |
+| Widen metric column | `MODIFY COLUMN col_name type(length)` | Only `NCHAR`/`BINARY`; cannot decrease |
+| Add tag | `ADD TAG tag_name type` | Max 128 tags, 16 KB total |
+| Drop tag | `DROP TAG tag_name` | Propagates to all subtables |
+| Rename tag | `RENAME TAG old new` | Propagates to all subtables |
+| Widen tag | `MODIFY TAG tag_name type(length)` | Only `NCHAR`/`BINARY`; cannot decrease |
+
+<Warning>
+You **cannot** add, drop, or modify the primary key (timestamp) column of a supertable.
+</Warning>
+
+**Example:**
+
+```sql
+-- Add a new metric column
+ALTER STABLE power.meters ADD COLUMN freq FLOAT;
+
+-- Add a new tag
+ALTER STABLE power.meters ADD TAG city VARCHAR(32);
+
+-- Rename a tag
+ALTER STABLE power.meters RENAME TAG groupId group_id;
+```
+
+## ALTER TABLE (Subtable)
+
+Subtable column/tag structure can only be modified at the supertable level. The only subtable-specific modification is updating tag values:
+
+```sql
+-- Set tag values on a subtable
+ALTER TABLE power.d1001 SET TAG location = 'Beijing.Haidian', groupId = 3;
+
+-- Batch update multiple subtables
+ALTER TABLE power.d1001 SET TAG location = 'Beijing.Haidian'
+       power.d1002 SET TAG location = 'Shanghai.Pudong';
+
+-- Update TTL or comment
+ALTER TABLE power.d1001 TTL 730;
+ALTER TABLE power.d1001 COMMENT 'Updated meter';
+```
+
+---
+
+## DROP TABLE
+
+```sql
+-- Drop one or more basic tables or subtables
+DROP TABLE [IF EXISTS] [db_name.]tb_name [, [IF EXISTS] [db_name.]tb_name] ...;
+```
+
+<Note>
+Dropping a table marks data as deleted but does not immediately free disk space. Disk space is reclaimed when TDengine reorganizes data automatically or when you run `TRIM DATABASE`.
+</Note>
+
+## DROP STABLE
+
+```sql
+DROP STABLE [IF EXISTS] [db_name.]stb_name;
+```
+
+<Warning>
+Dropping a supertable **deletes all subtables and their data** within that supertable. This operation cannot be undone.
+</Warning>
+
+---
+
+## View Table Information
+
+### List all tables
+
+```sql
+SHOW TABLES [LIKE tb_name_wildcard];
+
+-- Example: find all meters starting with 'd1'
+SHOW TABLES LIKE 'd1%';
+```
+
+### Show creation statement
+
+```sql
+SHOW CREATE TABLE [db_name.]tb_name;
+```
+
+### Describe table schema
+
+```sql
+DESCRIBE [db_name.]tb_name;
+```
+
+Returns column names, types, lengths, and whether each column is a tag.
+
+### List all supertables
+
+```sql
+SHOW STABLES [LIKE tb_name_wildcard];
+```
+
+### Show supertable creation statement
+
+```sql
+SHOW CREATE STABLE stb_name;
+```
+
+### View all subtable tags
+
+```sql
+SHOW TABLE TAGS FROM [db_name.]stb_name;
+```
+
+### View tags for a specific subtable
+
+```sql
+SHOW TAGS FROM [db_name.]tb_name;
+```
+
+### Query tag values
+
+```sql
+-- Get distinct tag values efficiently (must include DISTINCT and TBNAME)
+SELECT DISTINCT TBNAME, location, groupId FROM power.meters;
+
+-- Use system table for comprehensive tag info
+SELECT table_name, tag_name, tag_type, tag_value
+FROM information_schema.ins_tags
+WHERE stable_name = 'meters';
+
+-- Count subtables under a supertable
+SELECT COUNT(*) FROM (SELECT DISTINCT TBNAME FROM power.meters);
+```
+
+---
+
+## Supertable Query Behavior
+
+When querying a supertable without `ORDER BY`, results are grouped by subtable — all rows from one subtable appear before the next. Add `ORDER BY ts` for time-ordered results across all subtables.
+
+```sql
+-- Query all subtables, ordered by time
+SELECT ts, current, voltage, location
+FROM power.meters
+WHERE ts >= NOW - 1h
+ORDER BY ts;
+```

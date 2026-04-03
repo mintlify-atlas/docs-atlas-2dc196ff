@@ -1,0 +1,90 @@
+---
+title: "Get Started with TDengine Cloud"
+description: "Sign up for TDengine Cloud, a fully managed time-series database service, and create your first instance — no installation required."
+---
+
+TDengine Cloud is a fully managed cloud service for industrial big data. It delivers all features of TDengine TSDB Enterprise as a cloud-native solution on Amazon Web Services, Microsoft Azure, or Google Cloud Platform — with no infrastructure to install or maintain.
+
+<Tip>
+  You can register for a TDengine Cloud account for free and automatically receive **$250 in credit** to test TDengine for yourself.
+</Tip>
+
+## Create an account
+
+<Steps>
+  <Step title="Open the TDengine Cloud website">
+    In a web browser, go to [cloud.tdengine.com](https://cloud.tdengine.com).
+  </Step>
+
+  <Step title="Sign up">
+    Under **Sign Up**, enter your email address and organization name, then click **Get Confirmation Code**. Enter the code sent to your email address.
+
+    Read the Terms of Service and Privacy Policy, then click **Sign up for TDengine Cloud**.
+  </Step>
+
+  <Step title="Enter your account details">
+    On the next page, enter your name and create a password.
+
+    <Note>
+      Your password must be 8–20 characters and include letters, digits, and at least one special character. Supported special characters: `. ~ ! @ # $ ^ & *`
+    </Note>
+
+    Optionally, enter your phone number and job title, and select a profile picture (JPG or PNG, under 1 MB).
+
+    Click **Continue**.
+  </Step>
+</Steps>
+
+## Create an instance
+
+<Steps>
+  <Step title="Select the instance type">
+    In the dialog that appears, select **TSDB** to create a TDengine TSDB instance.
+  </Step>
+
+  <Step title="Choose a cloud provider and region">
+    Select your preferred cloud provider (AWS, Azure, or GCP) and the region closest to your location from the drop-down lists.
+  </Step>
+
+  <Step title="Configure the instance">
+    Enter a name for your instance, then specify:
+
+    - **High availability** — enable for production workloads requiring redundancy.
+    - **Sample database** — enable to pre-populate your instance with example data for testing.
+    - **Price plan** — select the tier that fits your workload.
+  </Step>
+
+  <Step title="Create the instance">
+    Click **Create**. TDengine provisions and starts your TSDB Enterprise instance. This process may take a few minutes.
+  </Step>
+</Steps>
+
+## What's included
+
+TDengine Cloud gives you full access to TDengine TSDB Enterprise capabilities through a managed interface:
+
+<CardGroup cols={2}>
+  <Card title="No infrastructure to manage" icon="server">
+    TDengine handles provisioning, upgrades, backups, and scaling. You focus on your data.
+  </Card>
+  <Card title="Multi-cloud support" icon="cloud">
+    Deploy on AWS, Microsoft Azure, or Google Cloud Platform in the region of your choice.
+  </Card>
+  <Card title="Full Enterprise feature set" icon="star">
+    Access stream processing, caching, data subscription, zero-code connectors, and the TDgpt AI agent — all included.
+  </Card>
+  <Card title="TDengine Explorer included" icon="chart-line">
+    Use the web-based Explorer interface to browse databases, run SQL queries, and connect visualization tools.
+  </Card>
+</CardGroup>
+
+## Next steps
+
+Once your instance is running, connect to it using the connection string provided in the TDengine Cloud console. From there, you can:
+
+- Run SQL queries in the TDengine Explorer web interface
+- Connect Grafana or Power BI for dashboards and alerting
+- Use client libraries (Java, Python, C/C++) to build custom applications
+- Set up zero-code connectors to ingest data from MQTT, OPC, PI System, and other sources
+
+For full documentation on TDengine Cloud, see the [TDengine Cloud documentation](https://docs.tdengine.com/cloud/).

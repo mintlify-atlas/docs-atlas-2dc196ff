@@ -1,0 +1,498 @@
+---
+title: "User-Defined Functions (UDF)"
+description: "Extend TDengine's query capabilities with custom scalar and aggregate functions written in C or Python."
+---
+
+When the built-in SQL functions cannot satisfy your application logic, TDengine lets you write User-Defined Functions (UDFs) in C or Python. Once registered in the cluster, a UDF is called in SQL exactly like a built-in function.
+
+TDengine supports two categories of UDF:
+
+- **Scalar functions**: Output one value per input row (like `abs`, `sin`, `concat`).
+- **Aggregate functions**: Output one value for a group of input rows (like `avg`, `max`).
+
+C UDFs have performance nearly identical to built-in functions. Python UDFs can use any Python library available on the host. TDengine runs UDFs in an isolated subprocess, so a crash in a UDF does not affect the database service.
+
+## Writing a UDF in C
+
+### Scalar function interface
+
+A scalar function implements:
+
+```c
+int32_t scalarfn(SUdfDataBlock* inputDataBlock, SUdfColumn *resultColumn);
+```
+
+Optionally also:
+
+```c
+int32_t scalarfn_init();   // Called once before first use
+int32_t scalarfn_destroy(); // Called once on cleanup
+```
+
+### Aggregate function interface
+
+An aggregate function implements three functions:
+
+```c
+int32_t aggfn_start(SUdfInterBuf *interBuf);
+int32_t aggfn(SUdfDataBlock* inputBlock, SUdfInterBuf *interBuf, SUdfInterBuf *newInterBuf);
+int32_t aggfn_finish(SUdfInterBuf* interBuf, SUdfInterBuf *result);
+```
+
+- `aggfn_start`: Initializes the intermediate result buffer.
+- `aggfn`: Processes one data block and updates the intermediate buffer.
+- `aggfn_finish`: Converts the final intermediate buffer into the output value.
+
+### C data structures
+
+```c
+typedef struct SUdfColumnMeta {
+    int16_t type;
+    int32_t bytes;
+    uint8_t precision;
+    uint8_t scale;
+} SUdfColumnMeta;
+
+typedef struct SUdfColumn {
+    SUdfColumnMeta colMeta;
+    bool           hasNull;
+    SUdfColumnData colData;
+} SUdfColumn;
+
+typedef struct SUdfDataBlock {
+    int32_t   numOfRows;
+    int32_t   numOfCols;
+    SUdfColumn **udfCols;
+} SUdfDataBlock;
+
+typedef struct SUdfInterBuf {
+    int32_t bufLen;
+    char   *buf;
+    int8_t  numOfResult;  // 0 or 1
+} SUdfInterBuf;
+```
+
+### C scalar function template
+
+```c
+#include "taos.h"
+#include "taoserror.h"
+#include "taosudf.h"
+
+int32_t scalarfn_init() {
+    return TSDB_CODE_SUCCESS;
+}
+
+int32_t scalarfn(SUdfDataBlock* inputDataBlock, SUdfColumn* resultColumn) {
+    // Read from inputDataBlock, write results to resultColumn
+    return TSDB_CODE_SUCCESS;
+}
+
+int32_t scalarfn_destroy() {
+    return TSDB_CODE_SUCCESS;
+}
+```
+
+### C aggregate function template
+
+```c
+#include "taos.h"
+#include "taoserror.h"
+#include "taosudf.h"
+
+int32_t aggfn_init() {
+    return TSDB_CODE_SUCCESS;
+}
+
+int32_t aggfn_start(SUdfInterBuf* interBuf) {
+    // Initialize intermediate buffer
+    return TSDB_CODE_SUCCESS;
+}
+
+int32_t aggfn(SUdfDataBlock* inputBlock, SUdfInterBuf *interBuf, SUdfInterBuf *newInterBuf) {
+    // Aggregate inputBlock into newInterBuf using current interBuf
+    return TSDB_CODE_SUCCESS;
+}
+
+int32_t aggfn_finish(SUdfInterBuf* interBuf, SUdfInterBuf *result) {
+    // Extract final result from interBuf into result
+    return TSDB_CODE_SUCCESS;
+}
+
+int32_t aggfn_destroy() {
+    return TSDB_CODE_SUCCESS;
+}
+```
+
+### C scalar function example: `bit_and`
+
+`bit_and` computes the bitwise AND across multiple integer columns. Null values propagate to the result.
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "taosudf.h"
+
+DLL_EXPORT int32_t bit_and_init() { return 0; }
+
+DLL_EXPORT int32_t bit_and_destroy() { return 0; }
+
+DLL_EXPORT int32_t bit_and(SUdfDataBlock* block, SUdfColumn* resultCol) {
+    if (block->numOfCols < 2) {
+        return TSDB_CODE_UDF_INVALID_INPUT;
+    }
+
+    for (int32_t i = 0; i < block->numOfCols; ++i) {
+        if (block->udfCols[i]->colMeta.type != TSDB_DATA_TYPE_INT) {
+            return TSDB_CODE_UDF_INVALID_INPUT;
+        }
+    }
+
+    for (int32_t i = 0; i < block->numOfRows; ++i) {
+        if (udfColDataIsNull(block->udfCols[0], i)) {
+            udfColDataSetNull(resultCol, i);
+            continue;
+        }
+        int32_t result = *(int32_t*)udfColDataGetData(block->udfCols[0], i);
+        int32_t j = 1;
+        for (; j < block->numOfCols; ++j) {
+            if (udfColDataIsNull(block->udfCols[j], i)) {
+                udfColDataSetNull(resultCol, i);
+                break;
+            }
+            result &= *(int32_t*)udfColDataGetData(block->udfCols[j], i);
+        }
+        if (j == block->numOfCols) {
+            udfColDataSet(resultCol, i, (char*)&result, false);
+        }
+    }
+    resultCol->colData.numOfRows = block->numOfRows;
+    return TSDB_CODE_SUCCESS;
+}
+```
+
+### C aggregate function example: `l2norm`
+
+`l2norm` computes the L2 (Euclidean) norm: squares each value, sums them, then returns the square root.
+
+```c
+#include <math.h>
+#include <stdio.h>
+#include "taosudf.h"
+
+DLL_EXPORT int32_t l2norm_init()    { return 0; }
+DLL_EXPORT int32_t l2norm_destroy() { return 0; }
+
+DLL_EXPORT int32_t l2norm_start(SUdfInterBuf* buf) {
+    *(double*)(buf->buf) = 0;
+    buf->numOfResult = 0;
+    return 0;
+}
+
+DLL_EXPORT int32_t l2norm(SUdfDataBlock* block, SUdfInterBuf* interBuf, SUdfInterBuf* newInterBuf) {
+    double sumSquares = *(double*)interBuf->buf;
+
+    for (int32_t i = 0; i < block->numOfCols; ++i) {
+        for (int32_t j = 0; j < block->numOfRows; ++j) {
+            SUdfColumn *col = block->udfCols[i];
+            if (udfColDataIsNull(col, j)) continue;
+
+            double num = 0;
+            if (col->colMeta.type == TSDB_DATA_TYPE_INT) {
+                num = *(int32_t*)udfColDataGetData(col, j);
+            } else if (col->colMeta.type == TSDB_DATA_TYPE_DOUBLE) {
+                num = *(double*)udfColDataGetData(col, j);
+            }
+            sumSquares += num * num;
+        }
+    }
+
+    *(double*)(newInterBuf->buf) = sumSquares;
+    newInterBuf->numOfResult = 1;
+    return 0;
+}
+
+DLL_EXPORT int32_t l2norm_finish(SUdfInterBuf* buf, SUdfInterBuf* resultData) {
+    *(double*)(resultData->buf) = sqrt(*(double*)(buf->buf));
+    resultData->bufLen = sizeof(double);
+    resultData->numOfResult = 1;
+    return 0;
+}
+```
+
+### Compiling a C UDF
+
+```bash
+gcc -g -O0 -fPIC -shared bit_and.c -o libbitand.so
+```
+
+<Note>
+Use GCC 7.5 or later for reliable compilation of C UDFs.
+</Note>
+
+---
+
+## Writing a UDF in Python
+
+### Environment setup
+
+<Steps>
+  <Step title="Prepare Python runtime">
+    Ensure Python 3.7+ is installed. If compiling Python from source, use `--enable-shared` to generate a shared library.
+  </Step>
+  <Step title="Install taospyudf">
+    ```bash
+    pip3 install taospyudf
+    ```
+    The installer compiles a C++ extension (`libtaospyudf.so`) and copies it to `/usr/local/lib/`.
+  </Step>
+  <Step title="Update library path">
+    ```bash
+    ldconfig
+    ```
+  </Step>
+  <Step title="Restart taosd">
+    Restart the TDengine server so it picks up the new Python plugin.
+  </Step>
+</Steps>
+
+### Python scalar function interface
+
+```python
+def init():
+    pass
+
+def destroy():
+    pass
+
+def process(input: datablock) -> tuple[output_type]:
+    # input.shape() returns (rows, cols)
+    # input.data(row, col) returns the Python object at that position
+    pass
+```
+
+### Python aggregate function interface
+
+```python
+def init():
+    pass
+
+def destroy():
+    pass
+
+def start() -> bytes:
+    # Return serialized initial state
+    pass
+
+def reduce(inputs: datablock, buf: bytes) -> bytes:
+    # Deserialize buf, update with inputs, return new serialized state
+    pass
+
+def finish(buf: bytes) -> output_type:
+    # Deserialize buf and return the final scalar result
+    pass
+```
+
+<Note>
+You must always define both `init` and `destroy` in Python UDFs, even if they do nothing.
+</Note>
+
+### Python type mapping
+
+| TDengine SQL type                                              | Python type |
+| -------------------------------------------------------------- | ----------- |
+| `TINYINT` / `SMALLINT` / `INT` / `BIGINT`                     | `int`       |
+| `TINYINT UNSIGNED` / `SMALLINT UNSIGNED` / `INT UNSIGNED` / `BIGINT UNSIGNED` | `int` |
+| `FLOAT` / `DOUBLE`                                             | `float`     |
+| `BOOL`                                                         | `bool`      |
+| `BINARY` / `VARCHAR` / `NCHAR`                                 | `bytes`     |
+| `TIMESTAMP`                                                    | `int` (milliseconds since epoch) |
+| `NULL`                                                         | `None`      |
+
+### Python scalar function example: `myfun`
+
+Accepts a single integer column, outputs `ln(n² + 1)`:
+
+```python
+from math import log
+
+def init():
+    pass
+
+def destroy():
+    pass
+
+def process(block):
+    rows, _ = block.shape()
+    return [log(block.data(i, 0) ** 2 + 1) for i in range(rows)]
+```
+
+Save as `/root/udf/myfun.py`, then register and test:
+
+```sql
+CREATE FUNCTION myfun AS '/root/udf/myfun.py' OUTPUTTYPE DOUBLE LANGUAGE 'Python';
+```
+
+```text
+taos> SELECT myfun(v1) FROM t;
+         myfun(v1)         |
+============================
+               0.693147181 |
+               1.609437912 |
+               2.302585093 |
+```
+
+### Python aggregate function example: `myspread`
+
+Calculates the difference between the maximum and minimum values of a column:
+
+```python
+import io
+import math
+import pickle
+
+LOG_FILE = None
+
+def init():
+    global LOG_FILE
+    LOG_FILE = open("/var/log/taos/spread.log", "wt")
+
+def destroy():
+    LOG_FILE.close()
+
+def start():
+    return pickle.dumps((-math.inf, math.inf))
+
+def reduce(block, buf):
+    max_val, min_val = pickle.loads(buf)
+    rows, _ = block.shape()
+    for i in range(rows):
+        v = block.data(i, 0)
+        if v > max_val:
+            max_val = v
+        if v < min_val:
+            min_val = v
+    return pickle.dumps((max_val, min_val))
+
+def finish(buf):
+    max_val, min_val = pickle.loads(buf)
+    return max_val - min_val
+```
+
+```sql
+CREATE OR REPLACE AGGREGATE FUNCTION myspread
+  AS '/root/udf/myspread.py'
+  OUTPUTTYPE DOUBLE
+  BUFSIZE 128
+  LANGUAGE 'Python';
+```
+
+---
+
+## Installing UDFs
+
+### Create a scalar function
+
+```sql
+CREATE [OR REPLACE] FUNCTION function_name
+  AS library_path
+  OUTPUTTYPE output_type
+  LANGUAGE 'C' | 'Python';
+```
+
+### Create an aggregate function
+
+```sql
+CREATE [OR REPLACE] AGGREGATE FUNCTION function_name
+  AS library_path
+  OUTPUTTYPE output_type
+  BUFSIZE buffer_size
+  LANGUAGE 'C' | 'Python';
+```
+
+- `library_path`: Absolute path to the `.so` file (C) or `.py` file (Python).
+- `BUFSIZE`: Memory for intermediate results in bytes (aggregate functions only).
+- `OR REPLACE`: Update the existing function if it already exists.
+
+### Examples
+
+```sql
+-- C scalar UDF
+CREATE FUNCTION bit_and
+  AS '/home/taos/udf_example/libbitand.so'
+  OUTPUTTYPE INT
+  LANGUAGE 'C';
+
+-- C aggregate UDF
+CREATE AGGREGATE FUNCTION l2norm
+  AS '/home/taos/udf_example/libl2norm.so'
+  OUTPUTTYPE DOUBLE
+  BUFSIZE 8
+  LANGUAGE 'C';
+
+-- Python scalar UDF
+CREATE FUNCTION myfun
+  AS '/root/udf/myfun.py'
+  OUTPUTTYPE DOUBLE
+  LANGUAGE 'Python';
+
+-- Python aggregate UDF
+CREATE OR REPLACE AGGREGATE FUNCTION myspread
+  AS '/root/udf/myspread.py'
+  OUTPUTTYPE DOUBLE
+  BUFSIZE 128
+  LANGUAGE 'Python';
+```
+
+---
+
+## Using UDFs in SQL queries
+
+Once registered, call a UDF like any built-in function:
+
+```sql
+-- Scalar UDF
+SELECT bit_and(col1, col2) FROM my_table;
+
+-- Aggregate UDF
+SELECT l2norm(voltage) FROM meters GROUP BY groupid;
+
+-- Python scalar UDF
+SELECT myfun(v1) FROM t;
+
+-- Python aggregate UDF
+SELECT myspread(v1) FROM t;
+```
+
+---
+
+## Managing UDFs
+
+### List all registered UDFs
+
+```sql
+SHOW FUNCTIONS;
+```
+
+### View detailed function information
+
+```sql
+SELECT * FROM ins_functions \G;
+```
+
+Each time you update a UDF with `CREATE OR REPLACE`, its version number increments by 1.
+
+### Drop a UDF
+
+```sql
+DROP FUNCTION function_name;
+```
+
+<Note>
+UDFs are stored on the cluster's mnode and persist across restarts. All users in the cluster can call any registered UDF. Updates with `CREATE OR REPLACE` take effect immediately in TDengine 3.0.5.0 and later without requiring a server restart.
+</Note>
+
+<Warning>
+Within a Python UDF, do not use the `print` function for logging — output goes to the taosudf subprocess and is not visible. Instead, write to a file or use Python's `logging` module.
+</Warning>

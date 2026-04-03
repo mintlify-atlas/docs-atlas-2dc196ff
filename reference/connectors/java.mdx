@@ -1,0 +1,401 @@
+---
+title: "Java Client Library"
+description: "Reference for taos-jdbcdriver: JDBC URLs, connecting, executing SQL, PreparedStatement, ResultSet handling, HikariCP connection pool, and data subscription."
+---
+
+`taos-jdbcdriver` is the official Java connector for TDengine. It implements the JDBC 4.2 standard and supports WebSocket connections for all platforms, as well as native connections where the TDengine client driver is available.
+
+<Warning>
+The native connection (`jdbc:TAOS://`) and REST connection (`jdbc:TAOS-RS://`) are **deprecated** and will be discontinued on **2027-01-01**. Migrate to WebSocket (`jdbc:TAOS-WS://`).
+</Warning>
+
+## Requirements
+
+- **JDBC**: 4.2 and above
+- **JRE**: 8 and above
+- WebSocket connections: no TDengine client driver required
+- Native connections: requires the TDengine client driver on the same machine
+
+## Maven dependency
+
+<Tabs>
+  <Tab title="Maven">
+    ```xml
+    <dependency>
+      <groupId>com.taosdata.jdbc</groupId>
+      <artifactId>taos-jdbcdriver</artifactId>
+      <version>3.8.2</version>
+    </dependency>
+    ```
+  </Tab>
+  <Tab title="Gradle">
+    ```groovy
+    implementation 'com.taosdata.jdbc:taos-jdbcdriver:3.8.2'
+    ```
+  </Tab>
+</Tabs>
+
+## Connection URL format
+
+### WebSocket (recommended)
+
+```text
+jdbc:TAOS-WS://host:6041/[database][?user=root&password=taosdata&param=value...]
+```
+
+Multiple endpoints are supported for load balancing (WebSocket only):
+
+```text
+jdbc:TAOS-WS://host1:6041,host2:6041/power?user=root&password=taosdata
+```
+
+Use the `com.taosdata.jdbc.ws.WebSocketDriver` class:
+
+```java
+Class.forName("com.taosdata.jdbc.ws.WebSocketDriver");
+String url = "jdbc:TAOS-WS://localhost:6041/power?user=root&password=taosdata";
+Connection conn = DriverManager.getConnection(url);
+```
+
+### Native (deprecated)
+
+```text
+jdbc:TAOS://host:6030/[database][?user=root&password=taosdata&param=value...]
+```
+
+Use the `com.taosdata.jdbc.TSDBDriver` class:
+
+```java
+Class.forName("com.taosdata.jdbc.TSDBDriver");
+String url = "jdbc:TAOS://localhost:6030/power?user=root&password=taosdata";
+Connection conn = DriverManager.getConnection(url);
+```
+
+## Common URL parameters
+
+| Parameter | Description | Default |
+|---|---|---|
+| `user` | Username | `root` |
+| `password` | Password | `taosdata` |
+| `httpConnectTimeout` | Connection timeout (ms) | 60000 |
+| `messageWaitTimeout` | Message timeout (ms) | 60000 |
+| `useSSL` | Use SSL (WebSocket) | `false` |
+| `enableCompression` | Enable data compression | `false` |
+| `enableAutoReconnect` | Enable auto-reconnect | `false` |
+| `timezone` | Client timezone (IANA format) | system |
+| `varcharAsString` | Map VARCHAR/BINARY to String | `false` |
+
+## Connecting
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
+
+public class TDengineConnect {
+    public static void main(String[] args) throws SQLException {
+        String url = "jdbc:TAOS-WS://localhost:6041/power"
+                   + "?user=root&password=taosdata";
+
+        try (Connection conn = DriverManager.getConnection(url)) {
+            System.out.println("Connected to TDengine");
+            System.out.println("Server version: "
+                + conn.getMetaData().getDatabaseProductVersion());
+        }
+    }
+}
+```
+
+You can also use a `Properties` object:
+
+```java
+import java.util.Properties;
+
+Properties props = new Properties();
+props.setProperty("user", "root");
+props.setProperty("password", "taosdata");
+props.setProperty("enableCompression", "true");
+
+String url = "jdbc:TAOS-WS://localhost:6041/power";
+Connection conn = DriverManager.getConnection(url, props);
+```
+
+## Executing SQL with Statement
+
+Use a `Statement` for one-off SQL execution:
+
+```java
+import java.sql.*;
+
+public class TDengineExample {
+    public static void main(String[] args) throws Exception {
+        String url = "jdbc:TAOS-WS://localhost:6041?user=root&password=taosdata";
+
+        try (Connection conn = DriverManager.getConnection(url);
+             Statement stmt = conn.createStatement()) {
+
+            // DDL
+            stmt.execute("CREATE DATABASE IF NOT EXISTS power");
+            stmt.execute("USE power");
+            stmt.execute(
+                "CREATE STABLE IF NOT EXISTS meters " +
+                "(ts TIMESTAMP, current FLOAT, voltage INT, phase FLOAT) " +
+                "TAGS (groupId INT, location BINARY(24))"
+            );
+
+            // DML
+            stmt.execute(
+                "INSERT INTO d1001 USING meters TAGS(1, 'California.SanJose') " +
+                "VALUES (NOW, 10.3, 219, 0.31) (NOW+1s, 12.6, 218, 0.33)"
+            );
+            System.out.println("Rows inserted: " + stmt.getUpdateCount());
+
+            // DQL
+            try (ResultSet rs = stmt.executeQuery(
+                    "SELECT ts, current, voltage FROM power.meters LIMIT 5")) {
+                while (rs.next()) {
+                    Timestamp ts      = rs.getTimestamp("ts");
+                    float     current = rs.getFloat("current");
+                    int       voltage = rs.getInt("voltage");
+                    System.out.printf("%s  current=%.2f  voltage=%d%n",
+                                      ts, current, voltage);
+                }
+            }
+        }
+    }
+}
+```
+
+## Executing SQL with PreparedStatement
+
+Use `PreparedStatement` for parameterized queries and repeated inserts:
+
+```java
+import java.sql.*;
+
+public class TDenginePrepared {
+    public static void main(String[] args) throws Exception {
+        String url = "jdbc:TAOS-WS://localhost:6041/power?user=root&password=taosdata";
+
+        try (Connection conn = DriverManager.getConnection(url)) {
+
+            // Parameterized INSERT
+            String insertSql =
+                "INSERT INTO ? USING meters TAGS(?,?) VALUES (?,?,?,?)";
+
+            try (PreparedStatement pstmt = conn.prepareStatement(insertSql)) {
+                pstmt.setString(1, "d1001");
+                pstmt.setInt(2, 1);
+                pstmt.setString(3, "California.SanJose");
+                pstmt.setTimestamp(4, new Timestamp(System.currentTimeMillis()));
+                pstmt.setFloat(5, 10.3f);
+                pstmt.setInt(6, 219);
+                pstmt.setFloat(7, 0.31f);
+                pstmt.execute();
+                System.out.println("Rows inserted: " + pstmt.getUpdateCount());
+            }
+
+            // Parameterized SELECT
+            try (PreparedStatement qstmt = conn.prepareStatement(
+                    "SELECT ts, current FROM power.meters WHERE groupId = ? LIMIT 10")) {
+                qstmt.setInt(1, 1);
+                try (ResultSet rs = qstmt.executeQuery()) {
+                    while (rs.next()) {
+                        System.out.printf("ts=%s  current=%.2f%n",
+                            rs.getTimestamp(1), rs.getFloat(2));
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+## Handling ResultSet
+
+`ResultSet` follows the standard JDBC interface. TDengine-specific type mappings:
+
+| TDengine type | Java type |
+|---|---|
+| TIMESTAMP | `java.sql.Timestamp` |
+| BOOL | `java.lang.Boolean` |
+| TINYINT | `java.lang.Byte` |
+| SMALLINT | `java.lang.Short` |
+| INT | `java.lang.Integer` |
+| BIGINT | `java.lang.Long` |
+| FLOAT | `java.lang.Float` |
+| DOUBLE | `java.lang.Double` |
+| VARCHAR / BINARY | `byte[]` (or `String` with `varcharAsString=true`) |
+| NCHAR | `java.lang.String` |
+| JSON | `java.lang.String` |
+| DECIMAL | `java.math.BigDecimal` (WebSocket only) |
+
+```java
+try (ResultSet rs = stmt.executeQuery(
+        "SELECT ts, current, voltage, phase FROM power.meters LIMIT 100")) {
+
+    ResultSetMetaData meta = rs.getMetaData();
+    int colCount = meta.getColumnCount();
+
+    // Print column names
+    for (int i = 1; i <= colCount; i++) {
+        System.out.print(meta.getColumnName(i) + "\t");
+    }
+    System.out.println();
+
+    // Iterate rows
+    while (rs.next()) {
+        Timestamp ts      = rs.getTimestamp(1);
+        float     current = rs.getFloat(2);
+        int       voltage = rs.getInt(3);
+        float     phase   = rs.getFloat(4);
+        System.out.printf("%s\t%.2f\t%d\t%.4f%n", ts, current, voltage, phase);
+    }
+}
+```
+
+## Error handling
+
+```java
+try (Connection conn = DriverManager.getConnection(url);
+     Statement stmt = conn.createStatement()) {
+
+    stmt.execute("SELECT * FROM nonexistent_table");
+
+} catch (SQLException e) {
+    System.err.println("Error code: " + e.getErrorCode());
+    System.err.println("SQL state:  " + e.getSQLState());
+    System.err.println("Message:    " + e.getMessage());
+}
+```
+
+## Connection pool with HikariCP
+
+```java
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+import java.sql.*;
+
+public class HikariExample {
+    public static void main(String[] args) throws Exception {
+        HikariConfig config = new HikariConfig();
+        config.setDriverClassName("com.taosdata.jdbc.ws.WebSocketDriver");
+        config.setJdbcUrl("jdbc:TAOS-WS://localhost:6041/power");
+        config.setUsername("root");
+        config.setPassword("taosdata");
+        config.setMinimumIdle(5);
+        config.setMaximumPoolSize(15);
+        config.setConnectionTimeout(30_000);
+        config.setIdleTimeout(600_000);
+        config.setMaxLifetime(1_800_000);
+
+        try (HikariDataSource ds = new HikariDataSource(config)) {
+            try (Connection conn = ds.getConnection();
+                 Statement stmt  = conn.createStatement();
+                 ResultSet rs    = stmt.executeQuery(
+                     "SELECT COUNT(*) FROM power.meters")) {
+                if (rs.next()) {
+                    System.out.println("Total rows: " + rs.getLong(1));
+                }
+            }
+        }
+    }
+}
+```
+
+## Schemaless insert
+
+The `AbstractConnection` interface exposes schemaless write methods. Cast your connection to access them:
+
+```java
+import com.taosdata.jdbc.AbstractConnection;
+import com.taosdata.jdbc.SchemalessProtocolType;
+import com.taosdata.jdbc.SchemalessTimestampType;
+
+String url = "jdbc:TAOS-WS://localhost:6041?user=root&password=taosdata";
+AbstractConnection conn = DriverManager.getConnection(url)
+    .unwrap(AbstractConnection.class);
+
+String[] lines = {
+    "meters,groupid=2,location=California.SanFrancisco "
+    + "current=10.3f64,voltage=219i32,phase=0.31f64 1626006833639"
+};
+
+conn.schemalessInsert(
+    lines,
+    SchemalessProtocolType.LINE,
+    SchemalessTimestampType.MILLI_SECONDS
+);
+conn.close();
+```
+
+## Data subscription (TMQ)
+
+```java
+import com.taosdata.jdbc.tmq.*;
+import java.time.Duration;
+import java.util.*;
+
+public class TDengineTMQ {
+    public static void main(String[] args) throws Exception {
+        Properties props = new Properties();
+        props.setProperty("bootstrap.servers", "localhost:6041");
+        props.setProperty("msg.with.table.name", "true");
+        props.setProperty("enable.auto.commit", "true");
+        props.setProperty("auto.commit.interval.ms", "1000");
+        props.setProperty("group.id", "my-group");
+        props.setProperty("value.deserializer",
+            "com.taosdata.jdbc.tmq.ResultDeserializer");
+        props.setProperty("td.connect.user", "root");
+        props.setProperty("td.connect.pass", "taosdata");
+        props.setProperty("auto.offset.reset", "earliest");
+
+        try (TaosConsumer<ResultBean> consumer =
+                new TaosConsumer<>(props)) {
+
+            consumer.subscribe(List.of("topic_power"));
+
+            for (int i = 0; i < 50; i++) {
+                ConsumerRecords<ResultBean> records =
+                    consumer.poll(Duration.ofMillis(500));
+                for (ConsumerRecord<ResultBean> record : records) {
+                    System.out.println(record.value());
+                }
+            }
+        }
+    }
+}
+```
+
+## Migrating from REST to WebSocket
+
+If you are migrating from the deprecated REST (`jdbc:TAOS-RS://`) connection:
+
+<Steps>
+  <Step title="Change the driver class">
+    Replace `com.taosdata.jdbc.rs.RestfulDriver` with `com.taosdata.jdbc.ws.WebSocketDriver`.
+  </Step>
+  <Step title="Update the JDBC URL prefix">
+    Change `jdbc:TAOS-RS://` to `jdbc:TAOS-WS://`.
+  </Step>
+  <Step title="Remove batchfetch=true">
+    This parameter is not needed with WebSocket connections.
+  </Step>
+  <Step title="Verify">
+    Test your application. WebSocket provides lower latency, auto-reconnect support, and richer feature coverage.
+  </Step>
+</Steps>
+
+## Frequently asked questions
+
+**Why is `addBatch()` / `executeBatch()` slow?**
+
+TDengine's JDBC implementation executes each SQL added via `addBatch()` individually, so there is no reduction in round trips. Instead, concatenate multiple values in a single INSERT statement, or use `PreparedStatement` parameter binding.
+
+**`java.lang.UnsatisfiedLinkError: no taos in java.library.path`**
+
+The TDengine native client library is not on the library path. On Linux, create a symlink: `ln -s /usr/local/taos/driver/libtaos.so.x.x.x.x /usr/lib/libtaos.so`. On Windows, copy `taos.dll` to `C:\Windows\System32\`. Use WebSocket (`jdbc:TAOS-WS://`) to avoid this dependency entirely.
+
+**`taos-jdbcdriver` 3.x does not support TDengine 2.x**
+
+Use `taos-jdbcdriver` 2.x for TDengine 2.x servers.

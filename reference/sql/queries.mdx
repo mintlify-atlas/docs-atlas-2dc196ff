@@ -1,0 +1,506 @@
+---
+title: "Queries"
+description: "SQL reference for SELECT queries in TDengine, including time-series extensions: INTERVAL, SLIDING, FILL, PARTITION BY, SESSION, STATE_WINDOW, and EVENT_WINDOW."
+---
+
+## SELECT Syntax
+
+```sql
+SELECT [hints] [DISTINCT] [TAGS] select_list
+  FROM from_clause
+  [WHERE condition]
+  [PARTITION BY partition_expr [, ...]]
+  [window_clause]
+  [GROUP BY group_expr [, ...] [HAVING condition]]
+  [ORDER BY order_expr [DESC | ASC] [NULLS FIRST | NULLS LAST] [, ...]]
+  [SLIMIT limit_val [SOFFSET offset_val]]
+  [LIMIT limit_val [OFFSET offset_val]]
+```
+
+**Hints** (query optimizer directives):
+
+```sql
+SELECT /*+ BATCH_SCAN() */  ...   -- batch table scan for supertable JOINs
+SELECT /*+ NO_BATCH_SCAN() */ ... -- sequential scan
+SELECT /*+ SORT_FOR_GROUP() */ ... -- sort-based grouping
+SELECT /*+ PARTITION_FIRST() */ ... -- partition before aggregation
+SELECT /*+ PARA_TABLES_SORT() */ ... -- in-memory sort for timestamp ordering
+SELECT /*+ SKIP_TSMA() */ ...      -- disable TSMA optimization
+```
+
+---
+
+## FROM Clause
+
+```sql
+-- Single table
+SELECT * FROM power.meters;
+
+-- Cross-database
+SELECT * FROM power.meters;
+
+-- Subquery
+SELECT avg_current FROM (
+  SELECT AVG(current) AS avg_current, location
+  FROM power.meters
+  GROUP BY location
+);
+```
+
+---
+
+## WHERE Clause
+
+Filter rows before aggregation. Supports timestamp ranges and column conditions.
+
+```sql
+-- Relative time range
+SELECT * FROM meters WHERE ts >= NOW - 1h;
+
+-- Absolute time range
+SELECT * FROM meters
+WHERE ts > '2024-01-01 00:00:00'
+  AND ts <= '2024-01-02 00:00:00';
+
+-- Combined conditions
+SELECT * FROM meters
+WHERE ts >= NOW - 24h
+  AND voltage > 200
+  AND location LIKE '%Beijing%';
+
+-- Regex matching on table name or string columns
+SELECT * FROM meters WHERE tbname MATCH 'meter_[0-9]+';
+SELECT * FROM meters WHERE location NMATCH 'test';
+```
+
+**Timestamp shortcuts:**
+
+| Expression | Meaning |
+|------------|---------|
+| `NOW` | Current client time |
+| `TODAY` | Midnight of today |
+| `NOW - 2h` | 2 hours ago |
+| `NOW - 7d` | 7 days ago |
+| `'2024-06-01 08:00:00'` | Absolute timestamp |
+
+---
+
+## INTERVAL Clause (Tumbling & Sliding Windows)
+
+Aggregate data over fixed time windows.
+
+```sql
+SELECT _WSTART, _WEND, AVG(current), MAX(voltage)
+FROM meters
+WHERE ts >= NOW - 24h
+INTERVAL(10m);
+```
+
+**Sliding window** (window advances by a different amount than its size):
+
+```sql
+SELECT _WSTART, AVG(current)
+FROM meters
+WHERE ts >= NOW - 1h
+INTERVAL(10m) SLIDING(5m);
+```
+
+**With window offset** (shift window alignment):
+
+```sql
+-- Windows aligned to 30-second offset from Unix epoch 0
+SELECT _WSTART, COUNT(*) FROM meters
+INTERVAL(1m, 30s);
+
+-- Auto-align to query start time
+SELECT COUNT(*) FROM meters
+WHERE ts >= '2024-06-01 14:38:05'
+INTERVAL(1m, AUTO);
+```
+
+**Syntax:**
+
+```sql
+INTERVAL(interval_val [, interval_offset]) [SLIDING(sliding_val)] [FILL(fill_mode)]
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `interval_val` | Window duration. Minimum `10a` (10 ms). |
+| `interval_offset` | Window start offset from Unix epoch 0. Must be `< interval_val`. |
+| `sliding_val` | How far the window advances. Equal to `interval_val` = tumbling window. |
+
+**Time unit suffixes:** `b` ns, `u` µs, `a` ms, `s` sec, `m` min, `h` hr, `d` day, `w` week, `n` month, `y` year.
+
+<Note>
+`INTERVAL` must be used with at least one aggregate or selection function. The result set is strictly ordered by window start time.
+</Note>
+
+---
+
+## FILL Clause
+
+Specify how to fill missing data in time windows.
+
+```sql
+SELECT _WSTART, AVG(current)
+FROM meters
+WHERE ts >= NOW - 24h
+INTERVAL(1h)
+FILL(PREV);
+```
+
+| Mode | Description |
+|------|-------------|
+| `NONE` | No fill (default). Missing windows are omitted from results. |
+| `NULL` | Fill with `NULL`. |
+| `NULL_F` | Force fill with `NULL` even when no data exists in the entire range. |
+| `VALUE, val` | Fill with a specified constant. Example: `FILL(VALUE, 0)`. |
+| `VALUE_F, val` | Force fill with constant value. |
+| `PREV` | Fill with the previous valid value. |
+| `NEXT` | Fill with the next valid value. |
+| `NEAR` | Fill with the nearest valid value (not supported in window queries). |
+| `LINEAR` | Linear interpolation between surrounding valid values. |
+
+**Multiple-column fill:**
+
+```sql
+SELECT _WSTART, MIN(current), MAX(current)
+FROM meters
+INTERVAL(1h)
+FILL(VALUE, 0, 0);   -- one VALUE per fill column
+```
+
+**SURROUND clause** (limit fill search range):
+
+```sql
+-- In INTERVAL: only fill from windows within 5s of the gap
+SELECT _WSTART, AVG(current) FROM meters
+WHERE ts BETWEEN '2024-01-01' AND '2024-01-02'
+INTERVAL(1s) FILL(PREV) SURROUND(5s, 0);
+```
+
+<Warning>
+FILL can generate large result sets. Each query returns at most 10 million interpolated rows. Always specify a bounded time range when using FILL.
+</Warning>
+
+---
+
+## PARTITION BY
+
+Partition data by one or more columns (typically tags), then apply window operations or aggregations independently within each partition.
+
+```sql
+-- Average current per location, every 10 minutes
+SELECT _WSTART, location, AVG(current)
+FROM meters
+PARTITION BY location
+INTERVAL(10m);
+
+-- Independent window per subtable
+SELECT _WSTART, tbname, AVG(voltage)
+FROM meters
+PARTITION BY tbname
+INTERVAL(5m)
+FILL(PREV);
+```
+
+`PARTITION BY` is a superset of `GROUP BY`: it allows window operations after partitioning, which `GROUP BY` cannot.
+
+---
+
+## SESSION Window
+
+Group data into sessions separated by gaps exceeding a tolerance interval.
+
+```sql
+SELECT COUNT(*), FIRST(ts)
+FROM temp_sensor
+SESSION(ts, 12s);
+```
+
+Records within `tol_val` of each other belong to the same session window. A new window starts when the gap exceeds `tol_val`.
+
+```sql
+-- Session window per device
+SELECT _WSTART, _WEND, tbname, COUNT(*)
+FROM meters
+PARTITION BY tbname
+SESSION(ts, 5m);
+```
+
+---
+
+## STATE_WINDOW
+
+Divide data into windows based on the value of a state column. A new window opens when the value changes.
+
+```sql
+SELECT COUNT(*), FIRST(ts), status
+FROM device_log
+STATE_WINDOW(status);
+```
+
+**Extension strategy** (`extend` parameter):
+
+| Value | Behavior |
+|-------|----------|
+| `0` | Default: window spans first to last record of that state |
+| `1` | Window end extends to just before next window starts |
+| `2` | Window start extends to just after previous window ends |
+
+**Zero state** (exclude a specific state value from output):
+
+```sql
+-- State value 0 is treated as "zero state" and not output
+SELECT COUNT(*) FROM device_log
+STATE_WINDOW(status, 0, 0);
+```
+
+**TRUE_FOR filter** (only output windows meeting a minimum condition):
+
+```sql
+-- Only windows lasting ≥ 3 seconds
+SELECT COUNT(*) FROM device_log
+STATE_WINDOW(status)
+TRUE_FOR(3s);
+
+-- Only windows with ≥ 100 rows
+SELECT COUNT(*) FROM device_log
+STATE_WINDOW(status)
+TRUE_FOR(COUNT 100);
+
+-- Both conditions must be met
+SELECT COUNT(*) FROM device_log
+STATE_WINDOW(status)
+TRUE_FOR(3s AND COUNT 50);
+```
+
+---
+
+## EVENT_WINDOW
+
+Define windows with explicit start and end trigger conditions.
+
+```sql
+SELECT _WSTART, _WEND, COUNT(*)
+FROM power.meters
+EVENT_WINDOW START WITH current > 10 END WITH current <= 10;
+```
+
+- A window opens when `start_trigger_condition` is true.
+- The window closes when `end_trigger_condition` is true.
+- A data point that satisfies both conditions simultaneously forms a single-row window.
+- Windows that never close are not output.
+
+**With TRUE_FOR filter:**
+
+```sql
+SELECT _WSTART, _WEND, AVG(voltage)
+FROM power.meters
+EVENT_WINDOW START WITH voltage > 230 END WITH voltage <= 230
+TRUE_FOR(10m);
+```
+
+---
+
+## COUNT_WINDOW
+
+Divide data into windows of a fixed row count.
+
+```sql
+-- Window of 100 rows
+SELECT _WSTART, _WEND, AVG(current)
+FROM meters
+COUNT_WINDOW(100);
+
+-- Sliding count window (slide by 50 rows)
+SELECT _WSTART, AVG(current)
+FROM meters
+COUNT_WINDOW(100, 50);
+```
+
+---
+
+## GROUP BY
+
+Standard SQL aggregation grouping. Returns one row per group.
+
+```sql
+-- Aggregate by tag column
+SELECT location, AVG(current), MAX(voltage)
+FROM meters
+GROUP BY location;
+
+-- With HAVING filter
+SELECT location, AVG(current) AS avg_c
+FROM meters
+GROUP BY location
+HAVING avg_c > 5.0;
+```
+
+<Note>
+In supertable queries, grouping by tag columns is typically more efficient than grouping by regular data columns. Consider using `PARTITION BY` for tag-based grouping when window operations are also needed.
+</Note>
+
+---
+
+## ORDER BY
+
+```sql
+SELECT ts, current, location
+FROM meters
+WHERE ts >= NOW - 1h
+ORDER BY ts DESC;
+
+-- Multiple sort keys
+SELECT ts, current, location
+FROM meters
+ORDER BY location ASC, ts DESC NULLS LAST;
+```
+
+---
+
+## LIMIT and OFFSET
+
+```sql
+-- Return first 100 rows
+SELECT * FROM meters LIMIT 100;
+
+-- Return rows 51–100 (0-indexed offset)
+SELECT * FROM meters LIMIT 100 OFFSET 50;
+
+-- Abbreviated form
+SELECT * FROM meters LIMIT 50, 100;
+```
+
+When used with `PARTITION BY` or `GROUP BY`, `LIMIT` applies **per partition/group**, not to the total result.
+
+---
+
+## SLIMIT and SOFFSET
+
+Paginate over partitions (vgroups/groups) rather than individual rows.
+
+```sql
+-- Return rows from the first 5 partitions
+SELECT * FROM meters PARTITION BY tbname SLIMIT 5;
+
+-- Return rows from partitions 3–7 (0-indexed)
+SELECT * FROM meters PARTITION BY tbname SLIMIT 5 SOFFSET 2;
+```
+
+<Note>
+When an `ORDER BY` clause is present, only one partition (shard) is returned regardless of `SLIMIT`.
+</Note>
+
+---
+
+## Pseudo Columns
+
+Pseudo columns behave like regular columns but are not stored. Available in window queries:
+
+| Pseudo Column | Description |
+|---------------|-------------|
+| `_WSTART` | Window start timestamp |
+| `_WEND` | Window end timestamp (open interval for INTERVAL) |
+| `_WDURATION` | Window duration in database time units |
+| `_QSTART` | Query start timestamp (from WHERE condition) |
+| `_QEND` | Query end timestamp |
+| `_ROWTS` / `_c0` | Primary key timestamp column alias |
+| `TBNAME` | Subtable name (special tag in supertable queries) |
+
+**Example:**
+
+```sql
+SELECT _WSTART, _WEND, _WDURATION, AVG(current)
+FROM meters
+WHERE ts >= NOW - 24h
+INTERVAL(1h);
+```
+
+---
+
+## Practical Examples
+
+```sql
+-- Downsample to 10-minute averages with gap fill
+SELECT _WSTART, _WEND, AVG(current), MAX(current), APERCENTILE(current, 50)
+FROM power.meters
+WHERE ts >= NOW - 1d AND ts <= NOW
+INTERVAL(10m)
+FILL(PREV);
+
+-- Per-device 5-minute moving averages
+SELECT _WSTART, tbname, AVG(current)
+FROM power.meters
+PARTITION BY tbname
+INTERVAL(5m)
+FILL(LINEAR);
+
+-- Query with timestamp filter and string match
+SELECT ts, current, location
+FROM power.meters
+WHERE ts > '2024-01-01 08:00:00'
+  AND ts <= '2024-01-02 08:00:00'
+  AND location LIKE '%nny'
+ORDER BY ts DESC;
+
+-- Export results to file
+SELECT COUNT(*) FROM power.meters
+WHERE ts >= NOW - 10m AND voltage > 3.14
+>> /home/output.csv;
+```
+
+---
+
+## CASE Expression
+
+```sql
+-- Simple CASE
+SELECT CASE dev_status
+  WHEN 1 THEN 'Running'
+  WHEN 2 THEN 'Warning'
+  WHEN 3 THEN 'Downtime'
+  ELSE 'Unknown'
+END FROM dev_table;
+
+-- Searched CASE
+SELECT AVG(
+  CASE WHEN voltage < 200 OR voltage > 250
+    THEN 220
+    ELSE voltage
+  END
+) FROM meters;
+```
+
+---
+
+## Subqueries
+
+TDengine supports non-correlated subqueries in the `FROM` clause:
+
+```sql
+SELECT avg_c, location
+FROM (
+  SELECT AVG(current) AS avg_c, location
+  FROM power.meters
+  GROUP BY location
+) t
+WHERE avg_c > 5.0;
+```
+
+**Scalar subqueries** (return single value, from v3.4.0.0):
+
+```sql
+-- Filter by aggregate from another table
+SELECT col1 FROM tb2
+WHERE col1 >= (SELECT AVG(col1) FROM tb1);
+```
+
+**IN / NOT IN subqueries** (from v3.4.1.0):
+
+```sql
+SELECT col1 FROM tb2
+WHERE col1 IN (SELECT col1 FROM tb1 WHERE f2 > 10);
+```

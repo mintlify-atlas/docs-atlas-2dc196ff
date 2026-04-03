@@ -1,0 +1,282 @@
+---
+title: "Stream Processing"
+description: "Real-time stream processing in TDengine using SQL — trigger modes, window types, watermarks, and out-of-order data handling."
+---
+
+In time-series data processing, many common stream processing requirements arise across Industrial IoT workloads:
+
+- **Tiered storage and intelligent downsampling**: Industrial equipment may generate tens of thousands of raw data points per second. Storing everything at full fidelity causes storage costs to surge, query efficiency to drop, and historical trend analysis to respond slowly.
+- **Precomputation to accelerate real-time decisions**: When users query full datasets, the system may need to scan tens of billions of records, making it nearly impossible to return results in real time.
+- **Anomaly detection and low-latency alerts**: Monitoring and alerting require retrieving specific data with very low latency. Traditional batch processing often has delays on the order of minutes.
+
+TDengine's stream processing engine lets you define real-time transformations using SQL. Once data is written into a source table, it is automatically processed and results are pushed to target tables according to the trigger mode — delivering millisecond-level result latency even under high-throughput ingestion, without deploying Kafka, Flink, or other external stream systems.
+
+## How TDengine Stream Processing Differs
+
+TDengine adopts a **trigger–compute decoupling** strategy that extends beyond traditional stream processing:
+
+- **Extended processing targets**: The trigger source and the computation source can be different tables. A trigger table is not required at all.
+- **Extended triggering mechanisms**: Beyond data-write triggers, TDengine supports window-based triggers, scheduled triggers, and time-independent triggers. Data can be pre-filtered before trigger evaluation.
+- **Extended computation scope**: Any query statement is supported. Results can be written to output tables, sent as notifications over WebSocket, or both.
+
+## CREATE STREAM Syntax
+
+```sql
+CREATE STREAM [IF NOT EXISTS] [db_name.]stream_name options
+  [INTO [db_name.]table_name]
+  [NODELAY_CREATE_SUBTABLE]
+  [OUTPUT_SUBTABLE(tbname_expr)]
+  [(column_name1, column_name2 [COMPOSITE KEY][, ...])]
+  [TAGS (tag_definition [, ...])]
+  [AS subquery]
+
+options: {
+    trigger_type
+    [FROM [db_name.]table_name]
+    [PARTITION BY col1 [, ...]]
+    [STREAM_OPTIONS(stream_option [|...])]
+    [notification_definition]
+}
+
+trigger_type: {
+    PERIOD(period_time[, offset_time])
+  | SLIDING(sliding_val[, offset_time])
+  | INTERVAL(interval_val[, interval_offset]) SLIDING(sliding_val[, offset_time])
+  | SESSION(ts_col, session_val)
+  | STATE_WINDOW(col [, extend[, zeroth_state]]) [TRUE_FOR(true_for_expr)]
+  | EVENT_WINDOW(START WITH start_condition END WITH end_condition) [TRUE_FOR(true_for_expr)]
+  | COUNT_WINDOW(count_val[, sliding_val][, col1[, ...]])
+}
+```
+
+## Trigger Modes
+
+TDengine supports seven trigger types, each suited to different workloads:
+
+| Trigger | Description |
+|---------|-------------|
+| `PERIOD` | Fires at fixed system-time intervals (scheduled trigger) |
+| `SLIDING` / `INTERVAL` | Fires based on event-time windows as data arrives |
+| `SESSION` | Fires when session boundaries are detected in the data stream |
+| `STATE_WINDOW` | Fires when the value of a state column changes |
+| `EVENT_WINDOW` | Fires based on user-defined start and end conditions |
+| `COUNT_WINDOW` | Fires after a fixed number of rows accumulates |
+
+### Trigger Actions
+
+After a trigger fires, you can:
+
+- **Notify only**: Send an event notification to an external application over WebSocket.
+- **Compute only**: Execute any query and write results to an output table.
+- **Notify and compute**: Do both simultaneously.
+
+## Window Types
+
+### Time Window (INTERVAL + SLIDING)
+
+Divide data into fixed-size time windows. Use `SLIDING` to control how much each window advances. When `INTERVAL` and `SLIDING` are equal, windows are non-overlapping (tumbling windows).
+
+```sql
+-- For each subtable of stb1, compute the average of col1 every 5 minutes.
+-- Write each subtable's result to a separate subtable under stb2.
+CREATE STREAM sm1 INTERVAL(5m) SLIDING(5m) FROM stb1 PARTITION BY tbname
+  INTO stb2
+  AS
+    SELECT _twstart, avg(col1) FROM %%tbname
+    WHERE _c0 >= _twstart AND _c0 <= _twend;
+```
+
+### Session Window (SESSION)
+
+Group data into sessions separated by gaps of inactivity.
+
+```sql
+SESSION(ts_col, session_val)
+```
+
+A new session starts whenever consecutive events are separated by more than `session_val` in time.
+
+### State Window (STATE_WINDOW)
+
+Group data by the value of a designated state column. A new window opens each time the column value changes.
+
+```sql
+STATE_WINDOW(col [, extend[, zeroth_state]])
+```
+
+### Event Window (EVENT\_WINDOW)
+
+Define windows using arbitrary SQL conditions for open and close events.
+
+```sql
+-- Compute average temperature when it exceeds 80° and stays above
+-- that threshold for more than 10 minutes.
+CREATE STREAM `idmp`.`ana_temp`
+  EVENT_WINDOW(START WITH `temp` > 80 END WITH `temp` <= 80)
+  TRUE_FOR(10m)
+  FROM `idmp`.`vt_envsens02_471544`
+  STREAM_OPTIONS(IGNORE_DISORDER)
+  INTO `idmp`.`ana_temp`
+  AS
+    SELECT _twstart+0s AS output_timestamp, avg(`temp`) AS `avgtemp`
+    FROM idmp.`vt_engsens02_471544`
+    WHERE ts >= _twstart AND ts <= _twend;
+```
+
+### Count Window (COUNT\_WINDOW)
+
+Fire after a fixed number of rows have arrived — optionally filtered to specific columns.
+
+```sql
+-- Each time one row is written to tb1, compute the 5-minute rolling
+-- average of col1 in tb2 and write the result to tb3.
+CREATE STREAM sm1 COUNT_WINDOW(1) FROM tb1
+  INTO tb3 AS
+    SELECT _twstart, avg(col1) FROM tb2
+    WHERE _c0 >= _twend - 5m AND _c0 <= _twend;
+```
+
+## Watermark and Out-of-Order Data
+
+### WATERMARK
+
+`WATERMARK` defines the system's tolerance for out-of-order data. The current watermark is computed as:
+
+```
+current watermark = latest processed event time − WATERMARK interval
+```
+
+Only data with event times **earlier than the current watermark** are eligible for trigger evaluation. Windows whose time boundaries precede the watermark are triggered.
+
+For data that arrives out of order beyond the watermark, TDengine uses **recomputation** — re-triggering and re-executing the affected computation — to ensure correctness.
+
+### MAX\_DELAY
+
+`MAX_DELAY` defines the maximum processing-time a window can wait before being forcibly triggered, even if it has not yet closed. This is useful when you need bounded latency regardless of whether a window fills up.
+
+```sql
+-- Compute per-subtable averages. Trigger on window close OR after
+-- 1 minute has elapsed since the window opened, whichever comes first.
+-- Also backfill historical data on stream creation.
+CREATE STREAM sm2 INTERVAL(5m) SLIDING(5m) FROM stb1 PARTITION BY tbname
+  STREAM_OPTIONS(MAX_DELAY(1m) | FILL_HISTORY_FIRST)
+  INTO stb2
+  AS
+    SELECT _twstart, avg(col1) FROM %%tbname
+    WHERE _c0 >= _twstart AND _c0 <= _twend;
+```
+
+### Control Options Reference
+
+| Option | Description |
+|--------|-------------|
+| `WATERMARK(duration)` | Tolerance duration for out-of-order data |
+| `EXPIRED_TIME(exp_time)` | Ignore data that arrives after this interval |
+| `IGNORE_DISORDER` | Silently discard out-of-order rows in the trigger table |
+| `MAX_DELAY(delay_time)` | Force-trigger a window after this processing-time delay |
+| `FILL_HISTORY[(start_time)]` | Backfill historical data starting from the earliest record |
+| `FILL_HISTORY_FIRST[(start_time)]` | Backfill historical data with priority |
+| `PRE_FILTER(expr)` | Filter trigger-table rows before trigger evaluation |
+| `DELETE_OUTPUT_TABLE` | Delete output subtable when its trigger subtable is deleted |
+| `FORCE_OUTPUT` | Emit an output row even when computation produces no result |
+| `LOW_LATENCY_CALC` | Begin processing immediately on each trigger |
+| `CALC_NOTIFY_ONLY` | Send results as notifications only; do not write to output table |
+
+## Stream Task Placeholders
+
+Inside computation queries, you can reference trigger-event context using these placeholders:
+
+| Placeholder | Description |
+|-------------|-------------|
+| `_twstart` | Start timestamp of the current window |
+| `_twend` | End timestamp of the current window |
+| `_twduration` | Duration of the current window |
+| `_twrownum` | Number of rows in the current window |
+| `_tcurrent_ts` | Event time of the current trigger |
+| `_tprev_ts` | Event time of the previous trigger |
+| `_tnext_ts` | Event time of the next trigger |
+| `_tlocaltime` | System time of the current trigger |
+| `%%tbname` | Reference to the trigger group's table; use in `FROM %%tbname` |
+| `%%trows` | The set of rows captured at trigger time for this group |
+| `%%n` | Reference to the nth trigger grouping column |
+
+<Note>
+`FROM %%tbname WHERE _c0 >= _twstart AND _c0 <= _twend` and `FROM %%trows` are **not** equivalent. The former queries the full table within the window time range at execution time; the latter uses only the rows captured at trigger time.
+</Note>
+
+## Real Examples
+
+### Scheduled Trigger — Hourly Row Count
+
+```sql
+-- Every hour, compute the total number of rows in tb1
+-- and write the result to tb2 (millisecond-precision database).
+CREATE STREAM sm1 PERIOD(1h)
+  INTO tb2
+  AS
+    SELECT cast(_tlocaltime/1000000 AS TIMESTAMP), count(*) FROM tb1;
+```
+
+### Sliding Window with Notifications
+
+```sql
+-- Compute per-minute average meter current.
+-- Send notifications on window open and close to two targets.
+-- Do not notify during historical backfill.
+-- Pause and retry on delivery failure.
+CREATE STREAM avg_stream INTERVAL(1m) SLIDING(1m) FROM meters
+  NOTIFY ('ws://localhost:8080/notify', 'wss://192.168.1.1:8080/notify?key=foo')
+    ON ('WINDOW_OPEN', 'WINDOW_CLOSE')
+    NOTIFY_OPTIONS(NOTIFY_HISTORY | ON_FAILURE_PAUSE)
+  INTO avg_stb
+  AS
+    SELECT _twstart, _twend, AVG(current) FROM %%trows;
+```
+
+### Count Window with Notification Only
+
+```sql
+-- Every 10 rows written to tb1 where col1 > 0, compute the average
+-- of those 10 rows and send it as a notification. Do not persist results.
+CREATE STREAM sm2 COUNT_WINDOW(10, 1, col1) FROM tb1
+  STREAM_OPTIONS(CALC_NOTIFY_ONLY | PRE_FILTER(col1 > 0))
+  NOTIFY("ws://localhost:8080/notify") ON (WINDOW_CLOSE)
+  AS
+    SELECT avg(col1) FROM %%trows;
+```
+
+### Scheduled Notification (No Computation)
+
+```sql
+-- Every hour, send a notification with the current system time.
+CREATE STREAM sm1 PERIOD(1h)
+  NOTIFY("ws://localhost:8080/notify");
+```
+
+## Managing Streams
+
+### View Streams
+
+```sql
+SHOW STREAMS;
+```
+
+### Drop a Stream
+
+```sql
+DROP STREAM [IF EXISTS] stream_name;
+```
+
+Dropping a stream stops all associated processing tasks. The output table and its data are not automatically removed unless `DELETE_OUTPUT_TABLE` was specified when the stream was created.
+
+## High Availability
+
+Stream processing in TDengine separates compute from storage and requires at least one **snode** to be deployed. All stream processing tasks — except data reads — run exclusively on snodes.
+
+- Deploy multiple snodes across different physical nodes to enable high availability.
+- Each pair of snodes acts as replicas, storing stream state and progress information.
+- Stream tasks are load-balanced across all available snodes.
+
+<Tip>
+Deploy snodes on dedicated dnodes to prevent stream processing from competing with write or query workloads.
+</Tip>

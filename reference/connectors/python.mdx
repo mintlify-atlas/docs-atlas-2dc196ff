@@ -1,0 +1,440 @@
+---
+title: "Python Client Library"
+description: "Reference for taospy and taos-ws-py: connecting, executing queries, parameter binding, schemaless insert, DataFrame support, and TMQ data subscription."
+---
+
+`taospy` is the official TDengine Python connector. It provides a PEP 249-compliant interface and supports native and WebSocket connections, schemaless inserts, STMT2 parameter binding, and TMQ data subscriptions.
+
+## Installation
+
+<Tabs>
+  <Tab title="WebSocket (recommended)">
+    ```bash
+    pip3 install taos-ws-py
+    ```
+
+    WebSocket requires no local TDengine client driver. It connects through `taosAdapter` on port 6041.
+  </Tab>
+  <Tab title="Native">
+    ```bash
+    pip3 install taospy
+    ```
+
+    Native connections require the TDengine client driver (`libtaos`) to be installed on the same machine.
+  </Tab>
+  <Tab title="Both">
+    ```bash
+    pip3 install taospy taos-ws-py
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+For performance-critical applications, prefer WebSocket connections. Python's Global Interpreter Lock (GIL) limits native connection throughput because C-to-Python data conversions hold the GIL. WebSocket connections release the GIL during network I/O and delegate data parsing to the Rust connector and Go-based `taosAdapter`.
+</Note>
+
+## Python version compatibility
+
+Supports Python 3.0 and above.
+
+## Connection
+
+### WebSocket connection
+
+Import from `taosws` (provided by `taos-ws-py`) and use a DSN to specify the connection:
+
+```python
+import taosws
+
+# Connect using a DSN
+conn = taosws.connect("ws://root:taosdata@localhost:6041")
+
+cursor = conn.cursor()
+cursor.execute("SELECT server_version()")
+row = cursor.fetchone()
+print("Server version:", row[0])
+
+cursor.close()
+conn.close()
+```
+
+**WebSocket DSN format:**
+
+```text
+[ws|wss]://[username:password@]host:port[/database][?param=value&...]
+```
+
+| Parameter | Description | Default |
+|---|---|---|
+| `timezone` | IANA timezone (e.g., `Asia/Shanghai`) | local timezone |
+| `compression` | Enable data compression | `false` |
+| `conn_retries` | Max retries on connection failure | 5 |
+| `retry_backoff_ms` | Initial retry wait (ms) | 200 |
+| `retry_backoff_max_ms` | Max retry wait (ms) | 2000 |
+| `read_timeout` | Response timeout (seconds) | 300 |
+| `token` | Cloud service authentication token | — |
+
+You can also use keyword arguments instead of a DSN:
+
+```python
+conn = taosws.connect(
+    host="localhost",
+    port=6041,
+    user="root",
+    password="taosdata",
+    database="power",
+)
+```
+
+### Native connection
+
+Import from `taos` (provided by `taospy`):
+
+```python
+import taos
+
+conn = taos.connect(
+    host="localhost",
+    port=6030,
+    user="root",
+    password="taosdata",
+    database="power",
+)
+
+cursor = conn.cursor()
+cursor.execute("SELECT server_version()")
+print("Server version:", cursor.fetchone()[0])
+
+cursor.close()
+conn.close()
+```
+
+| Parameter | Description |
+|---|---|
+| `host` | Server hostname or IP |
+| `port` | Port (`6030` for native) |
+| `user` | Username |
+| `password` | Password |
+| `database` | Database name (optional) |
+| `timezone` | Client timezone |
+
+## Executing queries
+
+### cursor.execute()
+
+Executes a single SQL statement. For queries, use `fetchone()`, `fetchall()`, or `fetchmany()` to retrieve results.
+
+```python
+import taosws
+
+conn = taosws.connect("ws://root:taosdata@localhost:6041")
+cursor = conn.cursor()
+
+# DDL
+cursor.execute("CREATE DATABASE IF NOT EXISTS power")
+cursor.execute("USE power")
+cursor.execute("""
+    CREATE STABLE IF NOT EXISTS meters (
+        ts        TIMESTAMP,
+        current   FLOAT,
+        voltage   INT,
+        phase     FLOAT
+    ) TAGS (groupId INT, location BINARY(24))
+""")
+
+# DML
+cursor.execute("""
+    INSERT INTO d1001 USING meters TAGS(1, 'California.SanJose')
+    VALUES (NOW, 10.3, 219, 0.31)
+           (NOW+1s, 12.6, 218, 0.33)
+""")
+print("Rows inserted:", cursor.rowcount)
+
+# DQL
+cursor.execute("SELECT ts, current, voltage FROM power.meters LIMIT 5")
+rows = cursor.fetchall()
+for row in rows:
+    print(row)
+
+cursor.close()
+conn.close()
+```
+
+### cursor.fetchone() / fetchall() / fetchmany()
+
+| Method | Description |
+|---|---|
+| `fetchone()` | Returns the next row as a tuple, or `None` |
+| `fetchall()` | Returns all remaining rows as a list of tuples |
+| `fetchmany(size)` | Returns up to `size` rows |
+
+### Parameterized queries
+
+Pass a sequence of values as the second argument to `cursor.execute()`:
+
+```python
+cursor.execute(
+    "INSERT INTO d1001 USING meters TAGS(?,?) VALUES (?,?,?,?)",
+    (1, "California.SanJose", 1626006833639, 10.3, 219, 0.31)
+)
+```
+
+<Note>
+`cursor.execute()` with parameters in the native connector performs a string substitution. For high-throughput writes, use the STMT2 parameter binding API instead.
+</Note>
+
+## Connection-level execute (WebSocket)
+
+The `taosws.Connection` object also exposes `execute()` and `query()` methods directly, without going through a cursor:
+
+```python
+conn = taosws.connect("ws://root:taosdata@localhost:6041")
+
+# Returns the number of affected rows
+rows_affected = conn.execute("INSERT INTO power.d1001 VALUES (NOW, 10.5, 220, 0.32)")
+
+# Returns a TaosResult object
+result = conn.query("SELECT ts, current FROM power.meters LIMIT 10")
+for row in result:
+    print(row)  # each row is a tuple
+
+conn.close()
+```
+
+## DataFrame support
+
+`taospy` integrates with pandas through the PEP 249 interface. Use `pandas.read_sql()` to fetch query results directly into a DataFrame:
+
+```python
+import taos
+import pandas as pd
+
+conn = taos.connect(host="localhost", user="root", password="taosdata")
+
+df = pd.read_sql("SELECT ts, current, voltage FROM power.meters LIMIT 1000", conn)
+print(df.head())
+print(df.dtypes)
+
+conn.close()
+```
+
+For the WebSocket connector with `taos-ws-py` >= 0.6.7, SQLAlchemy integration is available:
+
+```python
+from sqlalchemy import create_engine
+import pandas as pd
+
+engine = create_engine("taosws://root:taosdata@localhost:6041/power")
+
+df = pd.read_sql("SELECT ts, current, voltage FROM meters LIMIT 1000", engine)
+print(df.head())
+```
+
+## Data type mapping
+
+| TDengine type | Python type |
+|---|---|
+| TIMESTAMP | `datetime` |
+| BOOL | `bool` |
+| TINYINT / SMALLINT / INT / BIGINT | `int` |
+| FLOAT / DOUBLE | `float` |
+| BINARY / NCHAR | `str` |
+| JSON | `str` |
+| VARBINARY | `bytearray` |
+| GEOMETRY | `bytearray` |
+| DECIMAL | `Decimal` |
+| BLOB | `bytearray` |
+
+<Note>
+Nanosecond-precision timestamps are returned as `int` rather than `datetime`, due to Python's lack of native nanosecond support. Use `pandas.to_datetime()` to convert them.
+</Note>
+
+## Schemaless insert
+
+### WebSocket
+
+```python
+import taosws
+
+conn = taosws.connect("ws://root:taosdata@localhost:6041")
+
+# InfluxDB Line Protocol
+lines = [
+    "meters,groupid=2,location=California.SanFrancisco "
+    "current=10.3f64,voltage=219i32,phase=0.31f64 1626006833639"
+]
+conn.schemaless_insert(
+    lines,
+    taosws.PySchemalessProtocol.Line,
+    taosws.PySchemalessPrecision.Millisecond,
+    ttl=0,
+    req_id=0,
+)
+
+conn.close()
+```
+
+### Native
+
+```python
+import taos
+from taos import SmlProtocol, SmlPrecision
+
+conn = taos.connect(host="localhost", user="root", password="taosdata")
+
+lines = [
+    "meters,groupid=2,location=California.SanFrancisco "
+    "current=10.3f64,voltage=219i32,phase=0.31f64 1626006833639"
+]
+conn.schemaless_insert(
+    lines,
+    SmlProtocol.LINE_PROTOCOL,
+    SmlPrecision.MILLISECONDS,
+)
+
+conn.close()
+```
+
+## STMT2 parameter binding
+
+For high-throughput writes, use the STMT2 API to bind parameters without re-parsing SQL on each execution.
+
+### WebSocket
+
+```python
+import taosws
+import time
+
+conn = taosws.connect("ws://root:taosdata@localhost:6041")
+
+stmt2 = conn.stmt2_statement()
+stmt2.prepare("INSERT INTO ? USING power.meters TAGS(?,?) VALUES (?,?,?,?)")
+
+# Bind data for one subtable
+now_ms = int(time.time() * 1000)
+stmt2.bind([
+    taosws.PyStmt2BindParam(
+        tbname="d1001",
+        tags=[1, "California.SanJose"],
+        cols=[[now_ms, now_ms + 1000], [10.3, 12.6], [219, 218], [0.31, 0.33]]
+    )
+])
+rows_written = stmt2.execute()
+print("Rows written:", rows_written)
+
+stmt2.close()
+conn.close()
+```
+
+### Native (STMT2)
+
+```python
+import taos
+import time
+
+conn = taos.connect(host="localhost", user="root", password="taosdata")
+stmt2 = conn.statement2("INSERT INTO ? USING power.meters TAGS(?,?) VALUES (?,?,?,?)")
+
+now_ms = int(time.time() * 1000)
+stmt2.bind_param(
+    tbnames=["d1001"],
+    tags=[[1, "California.SanJose"]],
+    datas=[[now_ms, now_ms + 1000], [10.3, 12.6], [219, 218], [0.31, 0.33]],
+)
+rows = stmt2.execute()
+print("Rows written:", rows)
+
+stmt2.close()
+conn.close()
+```
+
+## TMQ data subscription
+
+Subscribe to a TDengine topic to receive a stream of data changes.
+
+### WebSocket
+
+```python
+import taosws
+import time
+
+consumer = taosws.Consumer(conf={
+    "host": "localhost",
+    "port": "6041",
+    "group.id": "my-group",
+    "td.connect.user": "root",
+    "td.connect.pass": "taosdata",
+    "auto.offset.reset": "earliest",
+    "enable.auto.commit": "true",
+})
+
+consumer.subscribe(["topic_power"])
+
+try:
+    while True:
+        msg = consumer.poll(timeout=1.0)
+        if msg:
+            for row in msg:
+                print(row)
+            consumer.commit(msg)
+        time.sleep(0.1)
+finally:
+    consumer.unsubscribe()
+    consumer.close()
+```
+
+### Native
+
+```python
+from taos.tmq import Consumer
+import time
+
+consumer = Consumer({
+    "td.connect.ip": "localhost",
+    "td.connect.port": "6030",
+    "group.id": "my-group",
+    "td.connect.user": "root",
+    "td.connect.pass": "taosdata",
+    "auto.offset.reset": "earliest",
+    "enable.auto.commit": "true",
+    "auto.commit.interval.ms": "1000",
+})
+
+consumer.subscribe(["topic_power"])
+
+try:
+    while True:
+        msg = consumer.poll(1.0)
+        if msg:
+            for row in msg:
+                print(row)
+finally:
+    consumer.unsubscribe()
+    consumer.close()
+```
+
+## Exception types
+
+| Exception | Cause | Action |
+|---|---|---|
+| `InterfaceError` | `taosc` version too low | Check TDengine client version |
+| `ConnectionError` | Database connection error | Check server status and parameters |
+| `DatabaseError` | Database-level error | Check server version; upgrade connector |
+| `OperationalError` | API usage error | Check your code |
+| `ProgrammingError` | Interface call error | Check submitted data |
+| `StatementError` | STMT binding mismatch | Check parameters match SQL |
+| `SchemalessError` | Invalid schemaless format | Check data format and protocol type |
+| `TmqError` | TMQ consumer error | Check topic name and consumer config |
+
+```python
+import taosws
+
+try:
+    conn = taosws.connect("ws://root:taosdata@localhost:6041")
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM nonexistent_table")
+except taosws.DatabaseError as e:
+    print("Database error:", e)
+finally:
+    conn.close()
+```

@@ -1,0 +1,307 @@
+---
+title: "Schemaless Ingestion"
+description: "Write time-series data to TDengine without pre-defining table schemas using InfluxDB Line Protocol, OpenTSDB Telnet, or OpenTSDB JSON formats."
+---
+
+In IoT applications, data collection items often change frequently due to application upgrades or hardware adjustments. TDengine's schemaless ingestion lets you write data without creating supertables or subtables in advance. TDengine automatically creates the corresponding storage structures based on the data you write, and adds new columns or tag columns as needed.
+
+<Note>
+Supertables and subtables created through schemaless ingestion are fully functional and can also receive data from regular SQL `INSERT` statements. However, table names are generated from tag values using an MD5 hash, which makes them difficult to read directly.
+</Note>
+
+<Warning>
+Do not manually create supertables that will also receive schemaless writes. Mixed manual and schemaless table creation can cause unexpected errors.
+</Warning>
+
+## Supported protocols
+
+TDengine supports three schemaless protocols:
+
+| Protocol              | Constant                 | Description                             |
+| --------------------- | ------------------------ | --------------------------------------- |
+| InfluxDB Line Protocol| `SML_LINE_PROTOCOL`      | Extended InfluxDB line format           |
+| OpenTSDB Telnet       | `SML_TELNET_PROTOCOL`    | OpenTSDB text line protocol             |
+| OpenTSDB JSON         | `SML_JSON_PROTOCOL`      | OpenTSDB JSON format protocol           |
+
+## InfluxDB line protocol format
+
+The line format encodes a single data row as:
+
+```text
+measurement,tag_set field_set timestamp
+```
+
+- **measurement**: Maps to the supertable name. Separated from `tag_set` by a comma.
+- **tag_set**: Key-value pairs (`key=value`), separated by commas. Separated from `field_set` by a space. All tag values are stored as `nchar` type automatically.
+- **field_set**: Key-value pairs for data columns, separated by commas. Separated from `timestamp` by a space.
+- **timestamp**: The primary key timestamp for this row.
+
+### Type suffixes for field values
+
+Numeric types are distinguished by suffix:
+
+| Suffix        | Mapped TDengine type         | Size (bytes) |
+| ------------- | ---------------------------- | ------------ |
+| _(none)_ or `f64` | `DOUBLE`                | 8            |
+| `f32`         | `FLOAT`                      | 4            |
+| `i8` / `u8`   | `TINYINT` / `UTINYINT`       | 1            |
+| `i16` / `u16` | `SMALLINT` / `USMALLINT`     | 2            |
+| `i32` / `u32` | `INT` / `UINT`               | 4            |
+| `i64` / `i` / `u64` / `u` | `BIGINT` / `BIGINT` / `UBIGINT` / `UBIGINT` | 8 |
+
+String types:
+- `"abc"` — `VARCHAR`
+- `L"abc"` — `NCHAR`
+- `G"Point(4.343 89.342)"` — `GEOMETRY`
+- `B"\x98f46e"` or `B"hello"` — `VARBINARY`
+- `true`, `false`, `True`, `False`, `t`, `f`, `T`, `F` — `BOOL`
+
+### Example line
+
+```text
+st,t1=3,t2=4,t3=t3 c1=3i64,c3="passit",c2=false,c4=4f64 1626006833639000000
+```
+
+This line creates supertable `st` with three `nchar` tags (`t1`, `t2`, `t3`) and four data columns: `c1` (`bigint`), `c2` (`bool`), `c3` (`binary`), `c4` (`double`). The timestamp is in nanoseconds.
+
+The equivalent SQL schema that would be created:
+
+```sql
+CREATE STABLE st (
+    _ts TIMESTAMP,
+    c1 BIGINT,
+    c2 BOOL,
+    c3 BINARY(6),
+    c4 DOUBLE
+) TAGS (
+    t1 NCHAR(1),
+    t2 NCHAR(1),
+    t3 NCHAR(2)
+);
+```
+
+## OpenTSDB Telnet protocol format
+
+```text
+metric timestamp value tag_key=tag_value [tag_key=tag_value ...]
+```
+
+Example:
+
+```text
+metric_telnet 1707095283260 4 host=host0 interface=eth0
+```
+
+<Note>
+OpenTSDB Telnet and JSON protocols support only one data column per line. The time precision is determined by the length of the timestamp value, not by a separate configuration.
+</Note>
+
+## OpenTSDB JSON protocol format
+
+```json
+{
+  "metric": "metric_json",
+  "timestamp": 1626846400,
+  "value": 10.3,
+  "tags": {
+    "groupid": 2,
+    "location": "California.SanFrancisco",
+    "id": "d1001"
+  }
+}
+```
+
+## Precision configuration
+
+In `SML_LINE_PROTOCOL` mode, you must specify the timestamp precision explicitly:
+
+| Precision constant                | Meaning       |
+| --------------------------------- | ------------- |
+| `TSDB_SML_TIMESTAMP_HOURS`        | Hours         |
+| `TSDB_SML_TIMESTAMP_MINUTES`      | Minutes       |
+| `TSDB_SML_TIMESTAMP_SECONDS`      | Seconds       |
+| `TSDB_SML_TIMESTAMP_MILLI_SECONDS`| Milliseconds  |
+| `TSDB_SML_TIMESTAMP_MICRO_SECONDS`| Microseconds  |
+| `TSDB_SML_TIMESTAMP_NANO_SECONDS` | Nanoseconds   |
+
+For `SML_TELNET_PROTOCOL` and `SML_JSON_PROTOCOL`, precision is inferred from the timestamp length, consistent with standard OpenTSDB behavior.
+
+## Auto table creation behavior
+
+TDengine handles schema evolution automatically during schemaless writes:
+
+1. The subtable name is generated by computing the MD5 hash of `"measurement,tag_key1=tag_value1,tag_key2=tag_value2"` (tags sorted alphabetically) and prepending `t_`.
+2. If the supertable does not exist, it is created automatically.
+3. If the subtable does not exist, it is created automatically.
+4. If a tag column or data column does not exist in the supertable, it is added automatically (columns are never removed).
+5. If a column is not present in a data row, its value is set to `NULL`.
+6. If a `BINARY` or `NCHAR` column value exceeds the current column width, the column width is automatically increased.
+7. For `BINARY` column widths: if the first row sets `c5="pass"` (width 4) and the next row sends `c5="passit"` (width 6), the column expands to `binary(6)`.
+
+<Tip>
+To use readable table names instead of MD5 hashes, configure `smlChildTableName` in `taos.cfg` to designate one tag key as the subtable name. For example: `smlChildTableName=tname`. Inserting `st,tname=cpu1,t1=4 c1=3 ...` will create a table named `cpu1`.
+</Tip>
+
+## Escape rules
+
+| Field type     | Characters requiring backslash escape  |
+| -------------- | -------------------------------------- |
+| Supertable name| comma, space                           |
+| Tag name       | comma, equal sign, space               |
+| Tag value      | comma, equal sign, space               |
+| Column name    | comma, equal sign, space               |
+| Column value   | double quotes, backslash               |
+
+## Writing examples
+
+The following examples show how to write data using all three protocols via a WebSocket connection, using the `meters` supertable from the smart meters demo dataset.
+
+<Tabs>
+  <Tab title="Python">
+    ```python schemaless_ws.py
+    import taosws
+
+    host = "localhost"
+    port = 6041
+
+    lineDemo = [
+        "meters,groupid=2,location=California.SanFrancisco current=10.3000002f64,voltage=219i32,phase=0.31f64 1626006833639"
+    ]
+
+    telnetDemo = ["metric_telnet 1707095283260 4 host=host0 interface=eth0"]
+
+    jsonDemo = [
+        '{"metric": "metric_json","timestamp": 1626846400,"value": 10.3, "tags": {"groupid": 2, "location": "California.SanFrancisco", "id": "d1001"}}'
+    ]
+
+    conn = taosws.connect(
+        user="root",
+        password="taosdata",
+        host=host,
+        port=port,
+        database='power'
+    )
+
+    # InfluxDB line protocol — precision must be specified
+    conn.schemaless_insert(
+        lines=lineDemo,
+        protocol=taosws.PySchemalessProtocol.Line,
+        precision=taosws.PySchemalessPrecision.Millisecond,
+        ttl=0,
+        req_id=1,
+    )
+
+    # OpenTSDB Telnet — precision inferred from timestamp length
+    conn.schemaless_insert(
+        lines=telnetDemo,
+        protocol=taosws.PySchemalessProtocol.Telnet,
+        precision=taosws.PySchemalessPrecision.Microsecond,
+        ttl=0,
+        req_id=2,
+    )
+
+    # OpenTSDB JSON — precision inferred from timestamp length
+    conn.schemaless_insert(
+        lines=jsonDemo,
+        protocol=taosws.PySchemalessProtocol.Json,
+        precision=taosws.PySchemalessPrecision.Millisecond,
+        ttl=0,
+        req_id=3,
+    )
+
+    print("Inserted data with schemaless successfully.")
+    conn.close()
+    ```
+  </Tab>
+  <Tab title="C (native)">
+    ```c sml_insert_demo.c
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #include "taos.h"
+
+    int main() {
+        const char *host     = "localhost";
+        const char *user     = "root";
+        const char *password = "taosdata";
+        uint16_t    port     = 6030;
+
+        TAOS *taos = taos_connect(host, user, password, NULL, port);
+        if (taos == NULL) {
+            fprintf(stderr, "Failed to connect: %s\n", taos_errstr(NULL));
+            return EXIT_FAILURE;
+        }
+
+        taos_query(taos, "CREATE DATABASE IF NOT EXISTS power");
+        taos_query(taos, "USE power");
+
+        // InfluxDB line protocol
+        char *line_demo =
+            "meters,groupid=2,location=California.SanFrancisco "
+            "current=10.3000002f64,voltage=219i32,phase=0.31f64 1626006833639";
+        char     *lines[] = {line_demo};
+        TAOS_RES *result  = taos_schemaless_insert(
+            taos, lines, 1,
+            TSDB_SML_LINE_PROTOCOL, TSDB_SML_TIMESTAMP_MILLI_SECONDS);
+        printf("Inserted %d row(s) via line protocol.\n", taos_affected_rows(result));
+        taos_free_result(result);
+
+        // OpenTSDB Telnet protocol
+        char *telnet_demo = "metric_telnet 1707095283260 4 host=host0 interface=eth0";
+        char *telnets[]   = {telnet_demo};
+        result = taos_schemaless_insert(
+            taos, telnets, 1,
+            TSDB_SML_TELNET_PROTOCOL, TSDB_SML_TIMESTAMP_MILLI_SECONDS);
+        printf("Inserted %d row(s) via telnet protocol.\n", taos_affected_rows(result));
+        taos_free_result(result);
+
+        // OpenTSDB JSON protocol
+        char *json_demo =
+            "{\"metric\": \"metric_json\",\"timestamp\": 1626846400,"
+            "\"value\": 10.3, \"tags\": {\"groupid\": 2, "
+            "\"location\": \"California.SanFrancisco\", \"id\": \"d1001\"}}";
+        char *jsons[1];
+        jsons[0] = malloc(1024);
+        strncpy(jsons[0], json_demo, 1023);
+        result = taos_schemaless_insert(
+            taos, jsons, 1,
+            TSDB_SML_JSON_PROTOCOL, TSDB_SML_TIMESTAMP_NOT_CONFIGURED);
+        printf("Inserted %d row(s) via JSON protocol.\n", taos_affected_rows(result));
+        taos_free_result(result);
+        free(jsons[0]);
+
+        taos_close(taos);
+        taos_cleanup();
+        return 0;
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Querying schemaless data
+
+After running the examples above, you can query the auto-created tables with standard SQL:
+
+```sql
+-- List all supertables in the power database
+SHOW power.STABLES;
+
+-- Query data from the meters supertable
+SELECT * FROM power.meters LIMIT 5;
+
+-- Query a specific column across all subtables
+SELECT ts, current, location FROM power.meters WHERE ts > '2021-07-11';
+```
+
+Example output:
+
+```text
+taos> select * from power.meters limit 1 \G;
+*************************** 1.row ***************************
+     _ts: 2021-07-11 20:33:53.639
+ current: 10.300000199999999
+ voltage: 219
+   phase: 0.310000000000000
+ groupid: 2
+location: California.SanFrancisco
+```

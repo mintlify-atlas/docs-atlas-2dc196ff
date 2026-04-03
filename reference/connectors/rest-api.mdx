@@ -1,0 +1,479 @@
+---
+title: "REST API"
+description: "Reference for TDengine's REST API: endpoint format, authentication, request and response format, error codes, and curl examples."
+---
+
+TDengine provides a stateless RESTful API served by `taosAdapter`. You send SQL statements as the HTTP request body and receive JSON responses. No language-specific driver is required—any HTTP client works.
+
+<Note>
+The REST API is stateless. The `USE db_name` statement has no effect. Always prefix table names with the database name (e.g., `power.meters`), or specify a default database in the URL.
+</Note>
+
+## Prerequisites
+
+`taosAdapter` must be running before you use the REST API. On Linux systems managed by systemd:
+
+```bash
+systemctl start taosadapter
+```
+
+The REST API listens on port **6041** by default.
+
+## Endpoint
+
+```text
+POST http://<fqdn>:6041/rest/sql[/<db_name>][?tz=timezone&req_id=id&row_with_meta=true]
+```
+
+| URL component | Description |
+|---|---|
+| `<fqdn>` | FQDN or IP address of any node in the TDengine cluster |
+| `6041` | Default `taosAdapter` port (configured via `httpPort`) |
+| `<db_name>` | Optional default database for the SQL statement |
+| `tz` | Optional: timezone for returned timestamps (IANA format, e.g., `America/New_York`) |
+| `req_id` | Optional: request ID for tracing |
+| `row_with_meta` | Optional: return each row as a JSON object with column names as keys (supported from 3.3.2.0) |
+
+## Authentication
+
+TDengine supports three authentication mechanisms for the REST API.
+
+### Basic authentication
+
+Encode `username:password` as Base64 and send it in the `Authorization` header:
+
+```bash
+# root:taosdata → cm9vdDp0YW9zZGF0YQ==
+curl -L \
+  -H "Authorization: Basic cm9vdDp0YW9zZGF0YQ==" \
+  -d "SELECT server_version()" \
+  http://localhost:6041/rest/sql
+```
+
+Or use `curl -u`:
+
+```bash
+curl -L \
+  -u root:taosdata \
+  -d "SELECT server_version()" \
+  http://localhost:6041/rest/sql
+```
+
+### Bearer token authentication (v3.4.0+)
+
+Create a token with SQL, then use it in subsequent requests:
+
+```bash
+# Step 1: Create a token
+taos -e "CREATE TOKEN root_token FROM USER root\G;"
+
+# Step 2: Use the token
+curl -L \
+  -H "Authorization: Bearer <your-token-here>" \
+  -d "SELECT server_version()" \
+  http://localhost:6041/rest/sql
+```
+
+### Custom token authentication
+
+Obtain a token via the login endpoint, then use it with the `Taosd` scheme:
+
+```bash
+# Get token
+curl http://localhost:6041/rest/login/root/taosdata
+# Response: {"code":0,"desc":"/KfeAzX/f9na8qdtNZmtONryp201ma04bEl8Lcv..."}
+
+# Use token
+curl -L \
+  -H "Authorization: Taosd /KfeAzX/f9na8qdtNZmtONryp201ma04bEl8LcvLUd7..." \
+  -d "SELECT server_version()" \
+  http://localhost:6041/rest/sql
+```
+
+## Request format
+
+The request body is a plain SQL statement. The `Content-Type` header is optional but recommended to be `text/plain`.
+
+```bash
+curl -L \
+  -H "Authorization: Basic cm9vdDp0YW9zZGF0YQ==" \
+  -H "Content-Type: text/plain" \
+  -d "<SQL statement>" \
+  http://localhost:6041/rest/sql[/<db_name>]
+```
+
+## Response format
+
+### Successful query
+
+```json
+{
+  "code": 0,
+  "column_meta": [
+    ["ts",        "TIMESTAMP", 8],
+    ["current",   "FLOAT",     4],
+    ["voltage",   "INT",       4],
+    ["phase",     "FLOAT",     4]
+  ],
+  "data": [
+    ["2022-07-30T06:44:40.32Z", 10.3, 219, 0.31],
+    ["2022-07-30T06:44:41.32Z", 12.6, 218, 0.33]
+  ],
+  "rows": 2
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `code` | `int` | `0` = success |
+| `column_meta` | `[][3]any` | Array of `[column_name, column_type, type_length]` |
+| `data` | `[][]any` | Array of rows; each row is an array of values |
+| `rows` | `int` | Number of rows returned |
+
+Timestamps are returned in RFC3339 UTC format by default. Use the `tz` URL parameter to specify a different timezone.
+
+### Successful insert
+
+```json
+{
+  "code": 0,
+  "column_meta": [["affected_rows", "INT", 4]],
+  "data": [[2]],
+  "rows": 1
+}
+```
+
+### Error response
+
+```json
+{
+  "code": 9728,
+  "desc": "syntax error near \"1\""
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `code` | `int` | TDengine error code |
+| `desc` | `string` | Human-readable error message |
+
+### Key-value format (row_with_meta=true)
+
+When you include `row_with_meta=true` in the URL, each row is returned as a JSON object instead of an array:
+
+```json
+{
+  "code": 0,
+  "column_meta": [
+    ["ts",      "TIMESTAMP", 8],
+    ["current", "FLOAT",     4],
+    ["voltage", "INT",       4]
+  ],
+  "data": [
+    {"ts": "2017-07-14T02:40:00.000Z", "current": -2.498076, "voltage": 0}
+  ],
+  "rows": 1
+}
+```
+
+## Column types
+
+The `column_meta` field uses these type name strings:
+
+| String | TDengine type |
+|---|---|
+| `"TIMESTAMP"` | TIMESTAMP |
+| `"BOOL"` | BOOL |
+| `"TINYINT"` | TINYINT |
+| `"SMALLINT"` | SMALLINT |
+| `"INT"` | INT |
+| `"BIGINT"` | BIGINT |
+| `"FLOAT"` | FLOAT |
+| `"DOUBLE"` | DOUBLE |
+| `"VARCHAR"` | VARCHAR / BINARY |
+| `"NCHAR"` | NCHAR |
+| `"JSON"` | JSON |
+| `"VARBINARY"` | VARBINARY |
+| `"GEOMETRY"` | GEOMETRY |
+| `"DECIMAL(p,s)"` | DECIMAL |
+| `"BLOB"` | BLOB |
+
+`VARBINARY`, `GEOMETRY`, and `BLOB` values are returned as hex strings.
+
+## HTTP status codes
+
+By default (`httpCodeServerError=false`):
+
+| HTTP code | Condition |
+|---|---|
+| 200 | Success, or C interface error (check `code` in body) |
+| 400 | URL parameter error |
+| 401 | Authentication error |
+| 404 | Endpoint not found |
+| 503 | Insufficient system resources |
+
+With `httpCodeServerError=true`:
+
+| HTTP code | Condition |
+|---|---|
+| 200 | Success |
+| 400 | Parameter or SQL syntax error |
+| 401 | Authentication error |
+| 404 | Endpoint not found |
+| 500 | Other C interface error |
+| 502 | Network unavailable |
+| 503 | Insufficient system resources |
+
+## Examples
+
+### List all databases
+
+```bash
+curl -L \
+  -H "Authorization: Basic cm9vdDp0YW9zZGF0YQ==" \
+  -d "SELECT name, ntables, status FROM information_schema.ins_databases;" \
+  http://localhost:6041/rest/sql
+```
+
+Response:
+
+```json
+{
+  "code": 0,
+  "column_meta": [
+    ["name",    "VARCHAR", 64],
+    ["ntables", "BIGINT",  8],
+    ["status",  "VARCHAR", 10]
+  ],
+  "data": [
+    ["information_schema", 16, "ready"],
+    ["performance_schema", 9,  "ready"]
+  ],
+  "rows": 2
+}
+```
+
+### Create a database
+
+```bash
+curl -L \
+  -H "Authorization: Basic cm9vdDp0YW9zZGF0YQ==" \
+  -d "CREATE DATABASE IF NOT EXISTS power" \
+  http://localhost:6041/rest/sql
+```
+
+Response:
+
+```json
+{
+  "code": 0,
+  "column_meta": [["affected_rows", "INT", 4]],
+  "data": [[0]],
+  "rows": 1
+}
+```
+
+### Insert data
+
+```bash
+curl -L \
+  -H "Authorization: Basic cm9vdDp0YW9zZGF0YQ==" \
+  -d "INSERT INTO power.d1001 USING power.meters TAGS(1,'California.SanJose') VALUES (NOW, 10.3, 219, 0.31)" \
+  http://localhost:6041/rest/sql
+```
+
+Response:
+
+```json
+{
+  "code": 0,
+  "column_meta": [["affected_rows", "INT", 4]],
+  "data": [[1]],
+  "rows": 1
+}
+```
+
+### Query data
+
+```bash
+curl -L \
+  -H "Authorization: Basic cm9vdDp0YW9zZGF0YQ==" \
+  -d "SELECT ts, current, voltage, phase FROM power.d1001 LIMIT 5" \
+  http://localhost:6041/rest/sql
+```
+
+Response:
+
+```json
+{
+  "code": 0,
+  "column_meta": [
+    ["ts",      "TIMESTAMP", 8],
+    ["current", "FLOAT",     4],
+    ["voltage", "INT",       4],
+    ["phase",   "FLOAT",     4]
+  ],
+  "data": [
+    ["2022-07-30T06:44:40.320Z", 10.3, 219, 0.31],
+    ["2022-07-30T06:44:41.320Z", 12.6, 218, 0.33]
+  ],
+  "rows": 2
+}
+```
+
+### Query with timezone and key-value rows
+
+```bash
+curl -L \
+  -H "Authorization: Basic cm9vdDp0YW9zZGF0YQ==" \
+  -d "SELECT ts, current FROM power.meters LIMIT 2" \
+  "http://localhost:6041/rest/sql?tz=America/New_York&row_with_meta=true"
+```
+
+Response:
+
+```json
+{
+  "code": 0,
+  "column_meta": [
+    ["ts",      "TIMESTAMP", 8],
+    ["current", "FLOAT",     4]
+  ],
+  "data": [
+    {"ts": "2022-07-30T02:44:40.320-04:00", "current": 10.3},
+    {"ts": "2022-07-30T02:44:41.320-04:00", "current": 12.6}
+  ],
+  "rows": 2
+}
+```
+
+### Query with a default database in the URL
+
+When the database is specified in the URL, SQL statements can omit the database prefix:
+
+```bash
+curl -L \
+  -H "Authorization: Basic cm9vdDp0YW9zZGF0YQ==" \
+  -d "SELECT ts, current FROM meters LIMIT 5" \
+  http://localhost:6041/rest/sql/power
+```
+
+## Using the REST API from code
+
+<CodeGroup>
+
+```python Python
+import requests
+import base64
+
+url = "http://localhost:6041/rest/sql"
+credentials = base64.b64encode(b"root:taosdata").decode()
+headers = {
+    "Authorization": f"Basic {credentials}",
+    "Content-Type": "text/plain",
+}
+
+response = requests.post(
+    url,
+    headers=headers,
+    data="SELECT ts, current FROM power.meters LIMIT 5"
+)
+result = response.json()
+
+if result["code"] == 0:
+    for row in result["data"]:
+        print(row)
+else:
+    print("Error:", result["desc"])
+```
+
+```go Go
+package main
+
+import (
+    "bytes"
+    "encoding/json"
+    "fmt"
+    "io"
+    "net/http"
+)
+
+type TDResponse struct {
+    Code       int             `json:"code"`
+    ColumnMeta [][]interface{} `json:"column_meta"`
+    Data       [][]interface{} `json:"data"`
+    Rows       int             `json:"rows"`
+    Desc       string          `json:"desc"`
+}
+
+func main() {
+    req, _ := http.NewRequest("POST",
+        "http://localhost:6041/rest/sql",
+        bytes.NewBufferString("SELECT ts, current FROM power.meters LIMIT 5"))
+    req.Header.Set("Authorization", "Basic cm9vdDp0YW9zZGF0YQ==")
+    req.Header.Set("Content-Type", "text/plain")
+
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        panic(err)
+    }
+    defer resp.Body.Close()
+
+    body, _ := io.ReadAll(resp.Body)
+    var result TDResponse
+    json.Unmarshal(body, &result)
+
+    if result.Code == 0 {
+        for _, row := range result.Data {
+            fmt.Println(row)
+        }
+    } else {
+        fmt.Println("Error:", result.Desc)
+    }
+}
+```
+
+```java Java
+import java.net.http.*;
+import java.net.URI;
+import java.util.Base64;
+
+public class TDengineREST {
+    public static void main(String[] args) throws Exception {
+        String credentials = Base64.getEncoder()
+            .encodeToString("root:taosdata".getBytes());
+
+        HttpRequest request = HttpRequest.newBuilder()
+            .uri(URI.create("http://localhost:6041/rest/sql"))
+            .header("Authorization", "Basic " + credentials)
+            .header("Content-Type", "text/plain")
+            .POST(HttpRequest.BodyPublishers.ofString(
+                "SELECT ts, current FROM power.meters LIMIT 5"))
+            .build();
+
+        HttpResponse<String> response = HttpClient.newHttpClient()
+            .send(request, HttpResponse.BodyHandlers.ofString());
+
+        System.out.println(response.body());
+    }
+}
+```
+
+</CodeGroup>
+
+## Differences from TDengine 2.x
+
+| Feature | TDengine 2.x | TDengine 3.x |
+|---|---|---|
+| `/rest/sql` | Supported | Supported (different response format) |
+| `/rest/sqlt` | Supported | **Not supported** |
+| `/rest/sqlutc` | Supported | **Not supported** |
+| HTTP 400 | Not returned | Returned on parameter errors |
+| HTTP 401 | Not returned | Returned on auth failures |
+| HTTP 500 | Not returned | Returned on internal errors |
+| Response `status` field | `"succ"` / `"error"` | Not present; use `code` field |
+| Response `head` field | Column names array | Not present; use `column_meta` |
+
+<Warning>
+`/rest/sqlt` and `/rest/sqlutc` are no longer supported in TDengine 3.x. Use `/rest/sql` with the `tz` URL parameter to control timestamp timezone.
+</Warning>

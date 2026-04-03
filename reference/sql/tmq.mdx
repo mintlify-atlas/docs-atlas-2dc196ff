@@ -1,0 +1,175 @@
+---
+title: "Data Subscription SQL"
+description: "SQL reference for TDengine Message Queue (TMQ) — topics, consumer groups, and subscription management"
+---
+
+TDengine Message Queue (TMQ) provides Kafka-compatible data subscription. Use SQL to create and manage topics, then consume them with the TMQ client API in your application.
+
+<Note>
+The maximum number of topics per TDengine instance is controlled by the `tmqMaxTopicNum` parameter (default: 20).
+</Note>
+
+## CREATE TOPIC
+
+Topics define what data is available for subscription. TDengine supports three topic types:
+
+### Query topic
+
+Subscribe to the results of a SELECT statement. The schema is fixed at creation time.
+
+```sql
+CREATE TOPIC [IF NOT EXISTS] topic_name AS subquery
+```
+
+**Constraints:**
+- Supports `SELECT *`, column selection, conditional filters, and scalar functions
+- Does not support aggregate functions or time-window aggregation
+- Columns used in the query cannot be dropped or modified after topic creation (from v3.4.0.0, changes are allowed if you `RELOAD TOPIC` afterward)
+- Schema is fixed — new columns added to the table won't appear in subscription results
+
+```sql
+-- Subscribe to all current readings above 10A from smart meters
+CREATE TOPIC high_current AS
+  SELECT ts, current, voltage, phase, tbname
+  FROM meters
+  WHERE current > 10;
+```
+
+### Supertable topic
+
+Subscribe to all data from a supertable. Schema changes are allowed after creation.
+
+```sql
+CREATE TOPIC [IF NOT EXISTS] topic_name [WITH META] AS STABLE stb_name [where_condition]
+```
+
+**Parameters:**
+- `WITH META` — also returns DDL statements (CREATE TABLE, ALTER TABLE) for table migration use cases
+- `where_condition` — filter which child tables to subscribe to using tag columns or `tbname`
+
+```sql
+-- Subscribe to all meters data
+CREATE TOPIC meters_topic AS STABLE meters;
+
+-- Subscribe to only meters in California
+CREATE TOPIC ca_meters_topic AS STABLE meters WHERE location LIKE 'California%';
+
+-- Subscribe with DDL metadata (for migration)
+CREATE TOPIC meters_with_meta WITH META AS STABLE meters;
+```
+
+<Note>
+Supertable topics return unstructured data — the returned schema follows the supertable's current structure and changes when you alter the supertable.
+</Note>
+
+### Database topic
+
+Subscribe to all data in a database across all tables.
+
+```sql
+CREATE TOPIC [IF NOT EXISTS] topic_name [WITH META] AS DATABASE db_name;
+```
+
+```sql
+-- Subscribe to entire IoT database
+CREATE TOPIC iot_full WITH META AS DATABASE iot_db;
+```
+
+<Warning>
+Supertable and database topics are advanced modes. Use query topics for most applications.
+</Warning>
+
+## DROP TOPIC
+
+```sql
+DROP TOPIC [IF EXISTS] topic_name;
+
+-- Force-delete even if consumers are active (v3.3.6.0+)
+DROP TOPIC [IF EXISTS] FORCE topic_name;
+```
+
+Active consumers on a force-deleted topic will receive errors on their next poll.
+
+## RELOAD TOPIC
+
+Reload a query topic after schema changes (v3.3.9+). Use this when you need to update a topic after adding/removing columns or modifying tag lengths.
+
+```sql
+RELOAD TOPIC [IF EXISTS] topic_name AS subquery;
+```
+
+**Workflow for schema changes:**
+1. Stop all consumers on the topic
+2. Alter the table structure
+3. Execute `RELOAD TOPIC`
+4. Restart consumers
+
+## SHOW TOPICS
+
+```sql
+SHOW TOPICS;
+```
+
+Returns all topics in the current database with their type, SQL definition, and status.
+
+## Consumer groups
+
+Consumer groups are created automatically when a consumer application connects with a group ID. You cannot create them with SQL — use the TMQ client API in your connector.
+
+### DROP CONSUMER GROUP
+
+```sql
+DROP CONSUMER GROUP [IF EXISTS] cgroup_name ON topic_name;
+
+-- Force-delete even if consumers are active (v3.3.6.0+)
+DROP CONSUMER GROUP [IF EXISTS] FORCE cgroup_name ON topic_name;
+```
+
+### SHOW CONSUMERS
+
+```sql
+SHOW CONSUMERS;
+```
+
+Displays all active consumers in the current database, including their consumer group, assigned topic, and connection details.
+
+### SHOW SUBSCRIPTIONS
+
+```sql
+SHOW SUBSCRIPTIONS;
+```
+
+Displays the allocation between consumers and vgroups — useful for diagnosing subscription lag or imbalanced consumption.
+
+## Full workflow example
+
+```sql
+-- 1. Create the source supertable
+CREATE STABLE meters (
+  ts       TIMESTAMP,
+  current  FLOAT,
+  voltage  INT,
+  phase    FLOAT
+) TAGS (location VARCHAR(64), groupid INT);
+
+-- 2. Create a topic for real-time subscription
+CREATE TOPIC meters_topic AS SELECT ts, current, voltage, tbname FROM meters;
+
+-- 3. View the topic
+SHOW TOPICS;
+
+-- 4. After your application is done consuming, clean up
+DROP CONSUMER GROUP my_app_group ON meters_topic;
+DROP TOPIC meters_topic;
+```
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Data Subscription Guide" icon="rss" href="/advanced/data-subscription">
+    How to use TMQ in your application — consumer configuration, poll loop, and offset management
+  </Card>
+  <Card title="CREATE STREAM" icon="water" href="/reference/sql/stream">
+    Process subscription data in real time with stream processing
+  </Card>
+</CardGroup>

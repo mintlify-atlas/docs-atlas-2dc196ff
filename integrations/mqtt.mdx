@@ -1,0 +1,172 @@
+---
+title: "MQTT Integration"
+description: "Ingest data from MQTT brokers into TDengine for real-time IoT data pipelines"
+---
+
+TDengine can subscribe to data from an MQTT broker and write it directly into TDengine tables, enabling real-time IoT data pipelines without custom code.
+
+<Note>
+The zero-code MQTT connector is a TDengine Enterprise feature, available through TDengine Explorer. For OSS users, you can write MQTT data to TDengine using any MQTT client library and the TDengine REST API or native connectors.
+</Note>
+
+## Overview
+
+MQTT (Message Queuing Telemetry Transport) is the standard protocol for IoT device communication. TDengine's MQTT connector subscribes to MQTT topics and maps incoming payloads to TDengine tables automatically.
+
+**Data flow:** MQTT Broker → TDengine MQTT Connector → TDengine tables
+
+## Zero-Code MQTT Connector (Enterprise)
+
+The MQTT connector is configured through **TDengine Explorer** — no code required.
+
+<Steps>
+  <Step title="Add a data source">
+    In TDengine Explorer, navigate to **Data Writing** and click **+ Add Data Source**. Select **MQTT** from the type dropdown.
+  </Step>
+  <Step title="Configure connection">
+    Enter a task name, then configure the MQTT broker connection:
+
+    | Field | Description |
+    |-------|-------------|
+    | MQTT Address | Broker hostname or IP (e.g., `192.168.1.42`) |
+    | MQTT Port | Broker port (default: `1883`, TLS: `8883`) |
+    | User / Password | Broker credentials if authentication is required |
+    | MQTT Protocol | Choose `3.1`, `3.1.1`, or `5.0` |
+    | Client ID | Unique client identifier (prefixed with `taosx`) |
+    | Keep Alive | Heartbeat interval in seconds |
+    | Clean Session | Whether to clear session state on reconnect |
+
+    Click **Check Connection** to verify connectivity.
+  </Step>
+  <Step title="Configure topics">
+    In **Topics Qos Config**, specify the topics and QoS levels to subscribe:
+
+    ```
+    sensor/temperature::1
+    factory/+/status::0
+    ```
+
+    Format: `{topic_name}::{qos}` where QoS is `0`, `1`, or `2`.
+
+    For MQTT 5.0 shared subscriptions (load balancing across multiple connector instances):
+    ```
+    $share/{group_name}/{topic_name}::{qos}
+    ```
+  </Step>
+  <Step title="Configure topic parsing">
+    Use **Topic Analysis** to extract values from topic segments into variables. For example:
+
+    - Topic pattern: `factory/+/+`
+    - Parsing rule: `_/plant_id/machine_id`
+
+    This assigns the second segment to `plant_id` and third to `machine_id`, which can then be used as tag values in the data model.
+  </Step>
+  <Step title="Configure payload parsing">
+    TDengine uses a JSON extractor to parse MQTT message payloads. Provide a sample message body to auto-detect fields:
+
+    ```json
+    {"device_id": "d1001", "ts": 1700000000000, "current": 10.3, "voltage": 219, "phase": 0.31}
+    ```
+
+    Map extracted fields to TDengine columns:
+    - Assign the timestamp field to the `ts` column
+    - Map metric fields to data columns
+    - Map device/location identifiers to tag columns
+    - Set the target supertable name
+  </Step>
+  <Step title="Select target database and start">
+    Choose the target TDengine database, configure the table name pattern (can use extracted variables), and click **Start Task**.
+  </Step>
+</Steps>
+
+## Payload Formats
+
+The MQTT connector supports multiple message body formats:
+
+<Tabs>
+  <Tab title="JSON Object">
+    ```json
+    {"device": "sensor_01", "ts": 1700000000000, "temp": 23.5, "humidity": 65}
+    ```
+  </Tab>
+  <Tab title="JSON Array">
+    ```json
+    [
+      {"device": "sensor_01", "ts": 1700000000000, "temp": 23.5},
+      {"device": "sensor_01", "ts": 1700000001000, "temp": 23.7}
+    ]
+    ```
+  </Tab>
+  <Tab title="InfluxDB Line Protocol">
+    If your MQTT devices publish in InfluxDB line protocol format, TDengine can parse it directly:
+    ```
+    sensor,device=d1001,location=SF current=10.3,voltage=219i 1700000000000000000
+    ```
+  </Tab>
+</Tabs>
+
+## Manual Integration (OSS)
+
+For TDengine OSS, use any MQTT client library to receive messages and write to TDengine via the REST API or native connectors.
+
+<CodeGroup>
+```python Python (paho-mqtt + taospy)
+import paho.mqtt.client as mqtt
+import taosws
+
+# Connect to TDengine
+conn = taosws.connect("taosws://root:taosdata@localhost:6041")
+conn.execute("USE iot_db")
+
+def on_message(client, userdata, msg):
+    import json
+    payload = json.loads(msg.payload)
+    device = payload["device"]
+    ts = payload["ts"]
+    temp = payload["temperature"]
+    sql = f"INSERT INTO {device} USING sensors TAGS ('{device}') VALUES ({ts}, {temp})"
+    conn.execute(sql)
+
+mqttc = mqtt.Client()
+mqttc.on_message = on_message
+mqttc.connect("mqtt-broker-host", 1883)
+mqttc.subscribe("sensors/#")
+mqttc.loop_forever()
+```
+
+```bash REST API (curl)
+# Write a single reading via REST API
+curl -u root:taosdata \
+  -d "INSERT INTO d1001 USING sensors TAGS ('d1001') VALUES (now, 10.3, 219, 0.31)" \
+  http://localhost:6041/rest/sql
+```
+</CodeGroup>
+
+## Configuration Options
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| MQTT Protocol | Protocol version: `3.1`, `3.1.1`, `5.0` | `3.1` |
+| QoS | Message quality of service: 0, 1, or 2 | `0` |
+| Clean Session | Clear session state on reconnect | `true` |
+| Keep Alive | Heartbeat interval (seconds) | `60` |
+| Compression | Payload compression: none, gzip, snappy, lz4, zstd | `none` |
+| Char Encoding | Message body encoding: UTF_8, GBK, GB18030, BIG5 | `UTF_8` |
+| SSL Certificate | TLS certificate for encrypted connections | — |
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Data Subscription (TMQ)" icon="rss" href="/advanced/data-subscription">
+    Subscribe to TDengine data changes using the Kafka-compatible TMQ API
+  </Card>
+  <Card title="Stream Processing" icon="water" href="/advanced/stream-processing">
+    Process incoming MQTT data in real time with TDengine stream processing
+  </Card>
+  <Card title="REST API" icon="globe" href="/reference/connectors/rest-api">
+    Write MQTT data to TDengine using the HTTP REST API
+  </Card>
+  <Card title="Kafka Integration" icon="database" href="/integrations/kafka">
+    Use Kafka as an intermediate broker between MQTT and TDengine
+  </Card>
+</CardGroup>

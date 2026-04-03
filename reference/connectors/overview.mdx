@@ -1,0 +1,107 @@
+---
+title: "Client Libraries Overview"
+description: "Overview of TDengine client libraries, connection modes, and language support for C/C++, Java, Python, Go, Rust, Node.js, C#, and R."
+---
+
+TDengine provides official client libraries for all major programming languages. Each library lets you connect to a TDengine cluster, execute SQL, write time-series data, and subscribe to data streams via the TDengine Message Queue (TMQ).
+
+## Connection modes
+
+Every client library supports one or both of the following connection modes:
+
+**Native connection** — The client loads `libtaos` (or `taos.dll` on Windows) and communicates directly with `taosd` using TDengine's binary protocol on port 6030. Native connections require the client driver version to match the server version closely.
+
+**WebSocket connection** — The client connects to `taosAdapter` over HTTP/WebSocket on port 6041. No local TDengine installation is required. The server and client versions do not need to match exactly, making this the recommended approach for most applications.
+
+<Tip>
+Use the WebSocket connection mode unless you have a specific reason to use native. WebSocket connections are easier to deploy, support all platforms that can run HTTP clients, and perform comparably to native connections.
+</Tip>
+
+<Note>
+The REST API (`POST /rest/sql`) is a stateless HTTP interface also served by `taosAdapter`. It is the simplest integration option and requires no language-specific driver—any HTTP client works. See the [REST API](/reference/connectors/rest-api) page for details.
+</Note>
+
+## Feature support
+
+The following features are supported across WebSocket and native connections in all connectors:
+
+| Feature | Java | Python | Go | C# | Node.js | Rust | C/C++ |
+|---|---|---|---|---|---|---|---|
+| Connection management | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Execute SQL | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Parameter binding | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Data subscription (TMQ) | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Schemaless write | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+
+The REST API supports **Execute SQL** only.
+
+<Note>
+Node.js does not support native connections—use WebSocket only.
+</Note>
+
+## Version compatibility
+
+Use the following table to match your TDengine server version to the correct connector version:
+
+| TDengine version | Java | Python | Go | C# | Node.js | Rust | C/C++ |
+|---|---|---|---|---|---|---|---|
+| 3.3.0.0 and above | 3.3.0+ | taospy 2.7.15+, taos-ws-py 0.3.2+ | 3.5.5+ | 3.1.3+ | 3.1.0+ | latest | same as server |
+| 3.0.0.0 and above | 3.0.2+ | latest | 3.0 branch | 3.0.0 | 3.1.0 | latest | same as server |
+
+## Installing the client driver
+
+If you are using a **native connection** on a machine where TDengine server is not installed, you must install the TDengine client driver separately.
+
+<Steps>
+  <Step title="Download the client package">
+    Download the TDengine client package for your platform from the TDengine website. The client package installs the `libtaos` dynamic library and the `taos.h` header file.
+  </Step>
+  <Step title="Install the package">
+    On Linux, run the installer script. On Windows, run the `.exe` installer. On macOS, run the `.pkg` installer.
+
+    After installation, the files are available at:
+    - **Linux**: `/usr/local/taos/driver/libtaos.so`, header at `/usr/local/taos/include/taos.h`
+    - **Windows**: `C:\TDengine\driver\taos.dll`, header at `C:\TDengine\include\taos.h`
+    - **macOS**: `/usr/local/lib/libtaos.dylib`, header at `/usr/local/include/taos.h`
+  </Step>
+  <Step title="Verify the installation">
+    Run the TDengine CLI to confirm the client driver is working:
+
+    ```bash
+    taos -h <your-server-host> -u root -p taosdata
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+WebSocket connections do **not** require the client driver. If you are using WebSocket, skip the client driver installation entirely.
+</Warning>
+
+## Available connectors
+
+<CardGroup cols={2}>
+  <Card title="C/C++" icon="c" href="/reference/connectors/cpp">
+    Link against `libtaos` for native and WebSocket connections. Includes the full STMT2 parameter binding API, schemaless insert, async queries, and TMQ data subscription.
+  </Card>
+  <Card title="Python" icon="python" href="/reference/connectors/python">
+    Install `taospy` for native connections or `taos-ws-py` for WebSocket. Supports PEP 249 cursor interface, pandas DataFrames, schemaless insert, and TMQ subscriptions.
+  </Card>
+  <Card title="Java" icon="java" href="/reference/connectors/java">
+    JDBC-compatible driver (`taos-jdbcdriver`). Use `jdbc:TAOS-WS://` for WebSocket or `jdbc:TAOS://` for native. Integrates with HikariCP, Spring, and MyBatis.
+  </Card>
+  <Card title="Go" icon="golang" href="/reference/connectors/go">
+    Implements `database/sql/driver`. Use `taosWS` driver for WebSocket or `taosSql` for native. Supports schemaless insert and TMQ subscription via the `ws/unified` package.
+  </Card>
+  <Card title="REST API" icon="globe" href="/reference/connectors/rest-api">
+    Stateless HTTP interface served by `taosAdapter`. POST SQL statements to `/rest/sql`. Works with any HTTP client and requires no language-specific driver.
+  </Card>
+  <Card title="Rust" icon="rust" href="#">
+    Official Rust connector with WebSocket and native connection support.
+  </Card>
+  <Card title="Node.js" icon="node-js" href="#">
+    WebSocket-only connector for Node.js applications.
+  </Card>
+  <Card title="C#" icon="microsoft" href="#">
+    .NET connector with WebSocket and native connection support.
+  </Card>
+</CardGroup>

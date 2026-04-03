@@ -1,0 +1,281 @@
+---
+title: "Kafka"
+description: "How to integrate TDengine with Apache Kafka using Kafka Connect. Covers the Sink Connector for writing Kafka topics into TDengine, the Source Connector for reading TDengine into Kafka, data format handling, and configuration reference."
+---
+
+The TDengine Kafka Connector provides two Kafka Connect plugins:
+
+- **TDengine Sink Connector** — reads data from Kafka topics and writes it to TDengine.
+- **TDengine Source Connector** — reads data from TDengine and publishes it to Kafka topics.
+
+## Prerequisites
+
+- Linux operating system
+- Java 8 and Maven installed
+- Git and curl installed
+- TDengine installed and running
+- Kafka 3.x installed
+
+## Installing Kafka
+
+```bash
+KAFKA_PKG="kafka_2.13-3.4.0"
+curl -O "https://archive.apache.org/dist/kafka/3.4.0/${KAFKA_PKG}.tgz"
+tar xzf "${KAFKA_PKG}.tgz" -C /opt/
+ln -s "/opt/${KAFKA_PKG}" /opt/kafka
+```
+
+Add `$KAFKA_HOME/bin` to your `PATH`:
+
+```bash
+export KAFKA_HOME=/opt/kafka
+export PATH=$PATH:$KAFKA_HOME/bin
+```
+
+## Installing the TDengine Connector plugin
+
+<Steps>
+  <Step title="Clone and build">
+    ```bash
+    git clone --branch 3.0 https://github.com/taosdata/kafka-connect-tdengine.git
+    cd kafka-connect-tdengine
+    mvn clean package -Dmaven.test.skip=true
+    ```
+  </Step>
+  <Step title="Install the plugin">
+    ```bash
+    unzip -d $KAFKA_HOME/components/ \
+      target/components/packages/taosdata-kafka-connect-tdengine-*.zip
+    ```
+  </Step>
+  <Step title="Register the plugin path">
+    Add the plugin directory to `$KAFKA_HOME/config/connect-distributed.properties`:
+
+    ```properties
+    plugin.path=/usr/share/java,/opt/kafka/components
+    ```
+  </Step>
+</Steps>
+
+## Starting Kafka
+
+```bash
+zookeeper-server-start.sh -daemon $KAFKA_HOME/config/zookeeper.properties
+kafka-server-start.sh -daemon $KAFKA_HOME/config/server.properties
+connect-distributed.sh -daemon $KAFKA_HOME/config/connect-distributed.properties
+```
+
+Verify Kafka Connect is running:
+
+```bash
+curl http://localhost:8083/connectors
+```
+
+Expected output: `[]`
+
+## Sink Connector: Kafka → TDengine
+
+The Sink Connector consumes messages from one or more Kafka topics and writes them to TDengine. It uses TDengine's schemaless write interface, so the target database and supertables are created automatically.
+
+### Supported data formats
+
+| Format | `db.schemaless` value |
+|--------|----------------------|
+| InfluxDB line protocol | `line` |
+| OpenTSDB JSON | `json` |
+| OpenTSDB Telnet | `telnet` |
+
+### Create a Sink Connector
+
+Create a configuration file `sink-demo.json`:
+
+```json
+{
+  "name": "TDengineSinkConnector",
+  "config": {
+    "connector.class": "com.taosdata.kafka.connect.sink.TDengineSinkConnector",
+    "tasks.max": "1",
+    "topics": "meters",
+    "connection.url": "jdbc:TAOS://127.0.0.1:6030",
+    "connection.user": "root",
+    "connection.password": "taosdata",
+    "connection.database": "power",
+    "db.schemaless": "line",
+    "data.precision": "ns",
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "errors.tolerance": "all",
+    "errors.deadletterqueue.topic.name": "dead_letter_topic",
+    "errors.deadletterqueue.topic.replication.factor": 1
+  }
+}
+```
+
+Register the connector:
+
+```bash
+curl -X POST -d @sink-demo.json \
+  http://localhost:8083/connectors \
+  -H "Content-Type: application/json"
+```
+
+### Write test data
+
+Create test data in InfluxDB line format:
+
+```text
+meters,location=California.LosAngeles,groupid=2 current=11.8,voltage=221,phase=0.28 1648432611249000000
+meters,location=California.LosAngeles,groupid=2 current=13.4,voltage=223,phase=0.29 1648432611250000000
+meters,location=California.LosAngeles,groupid=3 current=10.8,voltage=223,phase=0.29 1648432611249000000
+meters,location=California.LosAngeles,groupid=3 current=11.3,voltage=221,phase=0.35 1648432611250000000
+```
+
+Produce the data to the `meters` topic:
+
+```bash
+cat test-data.txt | kafka-console-producer.sh \
+  --broker-list localhost:9092 \
+  --topic meters
+```
+
+<Warning>
+The Sink Connector automatically creates the target database with nanosecond precision. Ensure the timestamp precision in your data matches the configured `data.precision`.
+</Warning>
+
+### Verify data in TDengine
+
+```sql
+USE power;
+SELECT * FROM meters;
+```
+
+## Source Connector: TDengine → Kafka
+
+The Source Connector reads data from a TDengine database and publishes it to Kafka topics. It first pushes historical data in batches, then continues with incremental polling. It monitors table creation and automatically picks up new tables.
+
+### Create a Source Connector
+
+Create `source-demo.json`:
+
+```json
+{
+  "name": "TDengineSourceConnector",
+  "config": {
+    "connector.class": "com.taosdata.kafka.connect.source.TDengineSourceConnector",
+    "tasks.max": 1,
+    "subscription.group.id": "source-demo",
+    "connection.url": "jdbc:TAOS://127.0.0.1:6030",
+    "connection.user": "root",
+    "connection.password": "taosdata",
+    "connection.database": "test",
+    "topic.prefix": "tdengine",
+    "topic.delimiter": "-",
+    "topic.per.stable": true,
+    "topic.ignore.db": false,
+    "out.format": "line",
+    "data.precision": "ms",
+    "poll.interval.ms": 1000,
+    "fetch.max.rows": 100,
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.storage.StringConverter"
+  }
+}
+```
+
+Register the connector:
+
+```bash
+curl -X POST -d @source-demo.json \
+  http://localhost:8083/connectors \
+  -H "Content-Type: application/json"
+```
+
+### Monitor topic output
+
+```bash
+kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --from-beginning \
+  --topic tdengine-test-meters
+```
+
+Output appears in InfluxDB line format:
+
+```text
+meters,location="California.SanFrancisco",groupid=2i32 current=10.3f32,voltage=219i32,phase=0.31f32 1538548685000000000
+```
+
+New rows inserted into TDengine appear in the Kafka topic in real time.
+
+### Unloading connectors
+
+```bash
+curl -X DELETE http://localhost:8083/connectors/TDengineSinkConnector
+curl -X DELETE http://localhost:8083/connectors/TDengineSourceConnector
+```
+
+## Topic naming
+
+When `topic.per.stable = true`, the topic name for each supertable follows this pattern:
+
+```text
+<topic.prefix><topic.delimiter><connection.database><topic.delimiter><stable.name>
+```
+
+Example: prefix=`tdengine`, delimiter=`-`, database=`test`, supertable=`meters` → topic `tdengine-test-meters`.
+
+Set `topic.ignore.db = true` to omit the database name from the topic.
+
+## Configuration reference
+
+### Common parameters (Sink and Source)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `connection.url` | — | TDengine JDBC URL, e.g. `jdbc:TAOS://127.0.0.1:6030` |
+| `connection.user` | `root` | TDengine username |
+| `connection.password` | `taosdata` | TDengine password |
+| `connection.attempts` | `3` | Max connection attempts |
+| `connection.backoff.ms` | `5000` | Retry wait time (ms) |
+| `data.precision` | — | Timestamp precision: `ms`, `us`, `ns` |
+| `tasks.max` | `1` | Maximum parallel tasks |
+
+### Sink-specific parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `topics` | — | Comma-separated list of Kafka topics to consume |
+| `connection.database` | null | Target database; if null, uses `connection.database.prefix` |
+| `connection.database.prefix` | null | Prefix for auto-named database; supports `${topic}` placeholder |
+| `db.schemaless` | — | Data format: `line`, `json`, `telnet` |
+| `batch.size` | — | Records per batch write |
+| `max.retries` | `1` | Max retries on write error |
+| `retry.backoff.ms` | `3000` | Retry wait time on error (ms) |
+
+### Source-specific parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `connection.database` | — | Source database name |
+| `topic.prefix` | `""` | Topic name prefix |
+| `topic.delimiter` | `-` | Topic name segment separator |
+| `topic.per.stable` | — | One topic per supertable when `true`; one topic per database when `false` |
+| `topic.ignore.db` | `false` | Omit database name from topic when `true` |
+| `out.format` | `line` | Output format: `line` (InfluxDB) or `json` (OpenTSDB) |
+| `poll.interval.ms` | `1000` | Interval to check for new/deleted tables (ms) |
+| `fetch.max.rows` | `100` | Max rows per database read |
+| `subscription.group.id` | — | TDengine subscription group ID (required when `read.method = subscription`) |
+| `subscription.from` | `latest` | Starting position: `latest` or `earliest` |
+| `read.method` | `subscription` | Read method: `query` or `subscription` |
+
+## Performance tuning
+
+To improve throughput when writing to Kafka from TDengine, tune `$KAFKA_HOME/config/producer.properties`:
+
+| Parameter | Suggested value | Description |
+|-----------|----------------|-------------|
+| `producer.type` | `async` | Asynchronous sending improves throughput |
+| `request.required.acks` | `1` | Acknowledge from leader only, reduces latency |
+| `max.request.size` | `104857600` (100 MB) | Max data per producer request |
+| `batch.size` | `524288` (512 KB) | Batch size; larger batches improve throughput |
+| `buffer.memory` | `1073741824` (1 GB) | Total producer buffer memory |

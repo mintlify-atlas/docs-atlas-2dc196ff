@@ -1,0 +1,601 @@
+---
+title: "Functions"
+description: "Complete function reference for TDengine, covering aggregate, time-series, selection, string, math, and conversion functions with signatures and descriptions."
+---
+
+## Aggregate Functions
+
+Return one result row per group. Used with `GROUP BY`, `PARTITION BY`, or window clauses.
+
+### COUNT
+
+```sql
+COUNT({* | expr})
+```
+
+Count rows or non-NULL values.
+
+- `COUNT(*)` — total row count including NULLs
+- `COUNT(col)` — count of non-NULL values in `col`
+
+**Returns:** `BIGINT`
+
+### SUM
+
+```sql
+SUM(expr)
+```
+
+Sum of all non-NULL values. **Returns:** `DOUBLE`, `BIGINT`, or `DECIMAL` (matches input type for DECIMAL).
+
+### AVG
+
+```sql
+AVG(expr)
+```
+
+Arithmetic mean. **Returns:** `DOUBLE` (or `DECIMAL` for DECIMAL input).
+
+### MIN / MAX
+
+```sql
+MIN(expr)
+MAX(expr)
+```
+
+Minimum or maximum value. Accepts numeric types and (from v3.3.3.0) `VARCHAR`/`NCHAR`. **Returns:** same type as input.
+
+### STDDEV / STDDEV_POP / STD
+
+```sql
+STDDEV(expr)
+STDDEV_POP(expr)   -- alias for STDDEV (v3.3.3.0+)
+STD(expr)          -- alias for STDDEV (v3.3.8.0+)
+```
+
+Population standard deviation of a column. **Returns:** `DOUBLE`.
+
+### STDDEV_SAMP
+
+```sql
+STDDEV_SAMP(expr)
+```
+
+Sample standard deviation (divides by N−1). **Returns:** `DOUBLE`. Available from v3.3.8.0.
+
+### VARIANCE / VAR_POP
+
+```sql
+VARIANCE(expr)
+VAR_POP(expr)
+```
+
+Population variance. **Returns:** `DOUBLE`. Available from v3.3.3.0.
+
+### VAR_SAMP
+
+```sql
+VAR_SAMP(expr)
+```
+
+Sample variance (divides by N−1). **Returns:** `DOUBLE`. Available from v3.3.8.0.
+
+### SPREAD
+
+```sql
+SPREAD(expr)
+```
+
+Difference between maximum and minimum values in a column. **Returns:** `DOUBLE`. Applicable to `INTEGER` and `TIMESTAMP`.
+
+### PERCENTILE
+
+```sql
+PERCENTILE(expr, p [, p1] ...)
+```
+
+Exact percentile value(s). `p` ∈ `[0, 100]`. Returns up to 10 percentile values at once.
+
+- Single percentile: returns `DOUBLE`
+- Multiple percentiles: returns `VARCHAR` JSON array
+
+```sql
+-- Single percentile
+SELECT PERCENTILE(current, 95) FROM meters;
+
+-- Multiple percentiles in one call (recommended)
+SELECT PERCENTILE(current, 50, 90, 95, 99) FROM meters;
+```
+
+<Note>
+`PERCENTILE` requires two passes over the data and is not supported in outer queries of nested queries or in virtual tables.
+</Note>
+
+### APERCENTILE
+
+```sql
+APERCENTILE(expr, p [, algo_type])
+
+algo_type: { 'default' | 't-digest' }
+```
+
+Approximate percentile. Faster than `PERCENTILE` for large datasets. `p` ∈ `[0, 100]`. **Returns:** `DOUBLE`.
+
+- `'default'` — histogram-based algorithm
+- `'t-digest'` — T-Digest algorithm (slightly order-sensitive in supertable queries)
+
+### HYPERLOGLOG
+
+```sql
+HYPERLOGLOG(expr)
+```
+
+Approximate cardinality (distinct count) using the HyperLogLog algorithm. Standard error ≈ 0.81%. **Returns:** `INTEGER`.
+
+### HISTOGRAM
+
+```sql
+HISTOGRAM(expr, bin_type, bin_description, normalized)
+```
+
+Distribution of values across user-defined buckets.
+
+- `bin_type`: `'user_input'`, `'linear_bin'`, `'log_bin'`
+- `normalized`: `0` (counts) or `1` (fractions between 0–1)
+
+```sql
+SELECT HISTOGRAM(voltage, 'linear_bin',
+  '{"start":200,"width":5,"count":10,"infinity":true}', 1)
+FROM meters;
+```
+
+### LEASTSQUARES
+
+```sql
+LEASTSQUARES(expr, start_val, step_val)
+```
+
+Linear regression of a column. `start_val` is the initial independent variable; `step_val` is the step. **Returns:** string `(slope, intercept)`. Applicable to tables only (not supertables).
+
+---
+
+## Time-Series Specific Functions
+
+### FIRST / LAST
+
+```sql
+FIRST(expr)
+LAST(expr)
+```
+
+- `FIRST` — earliest non-NULL value (smallest timestamp)
+- `LAST` — latest non-NULL value (largest timestamp)
+
+```sql
+SELECT FIRST(ts), LAST(current) FROM meters;
+SELECT FIRST(*), LAST(*) FROM meters;   -- all columns
+```
+
+### LAST_ROW
+
+```sql
+LAST_ROW(expr)
+```
+
+Returns the **last row** (by timestamp) from a table or supertable, including NULL values (unlike `LAST` which skips NULLs). Greatly accelerated by `CACHEMODEL 'last_row'`.
+
+```sql
+SELECT LAST_ROW(current), LAST_ROW(voltage) FROM meters;
+```
+
+### TWA (Time-Weighted Average)
+
+```sql
+TWA(expr)
+```
+
+Time-weighted average over the queried time range. Calculates the area under the value-time curve divided by the time span. **Returns:** `DOUBLE`.
+
+```sql
+SELECT TWA(current) FROM meters WHERE ts >= NOW - 1h;
+```
+
+### IRATE (Instantaneous Rate)
+
+```sql
+IRATE(expr)
+```
+
+Instantaneous growth rate using the last two data points in the time interval. If the value decreases, only the last value is used. **Returns:** `DOUBLE`.
+
+```sql
+SELECT IRATE(bytes_received) FROM network WHERE ts >= NOW - 5m;
+```
+
+### DIFF
+
+```sql
+DIFF(expr [, ignore_option])
+
+ignore_option: { 0 | 1 | 2 | 3 }
+```
+
+Difference between each row and the previous non-NULL value in the same column.
+
+| Option | Behavior |
+|--------|----------|
+| `0` | Keep negative diffs, keep NULLs (default) |
+| `1` | Treat negative diffs as NULL |
+| `2` | Keep negative diffs, skip NULL diffs |
+| `3` | Treat negative diffs as NULL, skip NULL diffs |
+
+```sql
+SELECT _rowts, DIFF(current) FROM meters;
+SELECT _rowts, DIFF(current, 1) FROM meters;  -- ignore decreases
+```
+
+### DERIVATIVE
+
+```sql
+DERIVATIVE(expr, time_interval, ignore_negative)
+
+ignore_negative: { 0 | 1 }
+```
+
+Rate of change per `time_interval` time unit. `ignore_negative=1` ignores negative rates. **Returns:** `DOUBLE`.
+
+```sql
+SELECT _rowts, DERIVATIVE(current, 1s, 0) FROM meters;
+```
+
+### CSUM (Cumulative Sum)
+
+```sql
+CSUM(expr)
+```
+
+Running cumulative sum, ignoring NULLs. Returns a value for every input row.
+
+**Returns:** `INT64` (integer input), `DOUBLE` (float input), `UINT64` (unsigned integer input).
+
+```sql
+SELECT ts, current, CSUM(current) FROM meters;
+```
+
+### MAVG (Moving Average)
+
+```sql
+MAVG(expr, k)
+```
+
+Moving average over the last `k` consecutive values. `k` ∈ `[1, 1000]`. No result is output until `k` rows are available. **Returns:** `DOUBLE`.
+
+```sql
+SELECT ts, MAVG(current, 5) FROM meters;
+```
+
+### STATECOUNT
+
+```sql
+STATECOUNT(expr, oper, val)
+```
+
+Running count of consecutive rows satisfying a condition. Increments by 1 when true; resets to -1 when false. Skips NULLs. **Returns:** `INTEGER`.
+
+`oper`: `'LT'`, `'GT'`, `'LE'`, `'GE'`, `'NE'`, `'EQ'` (case-insensitive).
+
+```sql
+SELECT ts, STATECOUNT(voltage, 'LT', 200) FROM meters;
+```
+
+### STATEDURATION
+
+```sql
+STATEDURATION(expr, oper, val, unit)
+```
+
+Duration of time for which consecutive rows satisfy a condition. First matching row has value 0; subsequent rows accumulate elapsed time. Resets to -1 when condition is false. **Returns:** `INTEGER`.
+
+```sql
+SELECT ts, STATEDURATION(voltage, 'GT', 250, 1s) FROM meters;
+```
+
+### FILL_FORWARD
+
+```sql
+FILL_FORWARD(expr)
+```
+
+Replace NULLs with the previous non-NULL value (forward fill). If all prior values are NULL, leaves NULL. Supports arithmetic operations.
+
+```sql
+SELECT ts, FILL_FORWARD(current), FILL_FORWARD(voltage) FROM meters;
+SELECT FILL_FORWARD(f1) * FILL_FORWARD(f2) FROM tb;
+```
+
+### INTERP
+
+```sql
+INTERP(expr [, ignore_null_values])
+```
+
+Interpolated value at a specified time slice. Must be used with the `RANGE`, `EVERY`, and `FILL` clauses.
+
+```sql
+SELECT _irowts, INTERP(current)
+FROM meters
+RANGE('2024-01-01 00:00:00', '2024-01-01 01:00:00')
+EVERY(1m)
+FILL(LINEAR);
+```
+
+### ELAPSED
+
+```sql
+ELAPSED(ts_primary_key [, time_unit])
+```
+
+Duration covered by data in the query period, divided by `time_unit`. Used with `TWA` to compute area under a curve.
+
+```sql
+SELECT ELAPSED(ts, 1s) FROM meters WHERE ts >= NOW - 1h;
+```
+
+---
+
+## Selection Functions
+
+Return specific rows, not aggregates. The returned row includes its timestamp.
+
+### TOP / BOTTOM
+
+```sql
+TOP(expr, k)
+BOTTOM(expr, k)
+```
+
+Top-k or bottom-k non-NULL values. `k` ∈ `[1, 100]`. Returns associated timestamp. Does not support `FILL`.
+
+```sql
+SELECT TOP(current, 5) FROM meters WHERE ts >= NOW - 1h;
+SELECT BOTTOM(voltage, 3) FROM meters;
+```
+
+### PERCENTILE / APERCENTILE
+
+See [Aggregate Functions](#aggregate-functions) above.
+
+### UNIQUE
+
+```sql
+UNIQUE(expr)
+```
+
+Deduplicated values. For duplicate values, returns the one with the earliest timestamp.
+
+### TAIL
+
+```sql
+TAIL(expr, k [, offset_rows])
+```
+
+Last `k` records after skipping `offset_rows` from the end. `k`, `offset_rows` ∈ `[1, 100]`.
+
+```sql
+SELECT TAIL(current, 10) FROM meters;
+SELECT TAIL(current, 5, 2) FROM meters;  -- skip last 2, return next 5
+```
+
+### SAMPLE
+
+```sql
+SAMPLE(expr, k)
+```
+
+Random sample of `k` values. `k` ∈ `[1, 1000]`.
+
+### MODE
+
+```sql
+MODE(expr)
+```
+
+Most frequent value. Returns a random choice if multiple values tie.
+
+### LAG / LEAD
+
+```sql
+LAG(expr, offset [, default_val])
+LEAD(expr, offset [, default_val])
+```
+
+- `LAG` — value `offset` rows **before** the current row
+- `LEAD` — value `offset` rows **after** the current row
+
+`offset` must be > 0. Returns `default_val` (or NULL) when no row exists at that offset.
+
+```sql
+SELECT ts, current, LAG(current, 1) AS prev_current FROM meters;
+SELECT ts, current, LEAD(current, 1) AS next_current FROM meters;
+```
+
+<Note>
+`LAG` and `LEAD` are not supported inside window queries (`INTERVAL`, `SESSION`, `STATE_WINDOW`).
+</Note>
+
+### COLS
+
+```sql
+COLS(func(expr), output_expr1 [, output_expr2] ...)
+```
+
+For the row selected by a single-row selection function, return values of additional expressions. The result of `func(expr)` itself is not returned.
+
+```sql
+-- Get the timestamp of the maximum current and the maximum voltage
+SELECT COLS(MAX(current), ts), COLS(MAX(voltage), ts) FROM meters;
+```
+
+---
+
+## Math Functions
+
+Single-row scalar functions.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `ABS` | `ABS(expr)` | Absolute value |
+| `CEIL` | `CEIL(expr)` | Ceiling (round up) |
+| `FLOOR` | `FLOOR(expr)` | Floor (round down) |
+| `ROUND` | `ROUND(expr [, digits])` | Round to `digits` decimal places (default 0). Negative `digits` rounds left of decimal. |
+| `SQRT` | `SQRT(expr)` | Square root. **Returns:** `DOUBLE` |
+| `POW` | `POW(expr1, expr2)` | `expr1` raised to the power `expr2`. **Returns:** `DOUBLE` |
+| `LOG` | `LOG(expr1 [, expr2])` | Log of `expr1` base `expr2`. Omit `expr2` for natural log. **Returns:** `DOUBLE` |
+| `LN` | `LN(expr)` | Natural logarithm. **Returns:** `DOUBLE` |
+| `EXP` | `EXP(expr)` | `e` raised to `expr`. **Returns:** `DOUBLE` |
+| `MOD` | `MOD(expr1, expr2)` | `expr1 % expr2`. Returns NULL if `expr2 = 0`. **Returns:** `DOUBLE` |
+| `SIGN` | `SIGN(expr)` | Sign: `-1`, `0`, or `1`. |
+| `TRUNCATE` | `TRUNCATE(expr, digits)` | Truncate (not round) to `digits` decimal places. |
+| `GREATEST` | `GREATEST(e1, e2, ...)` | Maximum of all arguments. |
+| `LEAST` | `LEAST(e1, e2, ...)` | Minimum of all arguments. |
+| `SIN` / `COS` / `TAN` | `SIN(expr)` etc. | Trigonometric functions. **Returns:** `DOUBLE` |
+| `ASIN` / `ACOS` / `ATAN` | `ASIN(expr)` etc. | Inverse trig functions. **Returns:** `DOUBLE` |
+| `DEGREES` | `DEGREES(expr)` | Radians to degrees. **Returns:** `DOUBLE` |
+| `RADIANS` | `RADIANS(expr)` | Degrees to radians. **Returns:** `DOUBLE` |
+| `PI` | `PI()` | Value of π ≈ 3.14159... **Returns:** `DOUBLE` |
+| `RAND` | `RAND([seed])` | Uniform random number in `[0, 1)`. |
+
+---
+
+## String Functions
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `LENGTH` | `LENGTH(expr)` | Byte length of string. |
+| `CHAR_LENGTH` | `CHAR_LENGTH(expr)` | Character count (multi-byte aware). |
+| `CONCAT` | `CONCAT(e1, e2, ...)` | String concatenation. 2–8 args. Returns NULL if any arg is NULL. |
+| `CONCAT_WS` | `CONCAT_WS(sep, e1, e2, ...)` | Concatenate with separator. 3–9 args. |
+| `UPPER` | `UPPER(expr)` | Convert to uppercase. |
+| `LOWER` | `LOWER(expr)` | Convert to lowercase. |
+| `LTRIM` | `LTRIM(expr)` | Remove leading spaces. |
+| `RTRIM` | `RTRIM(expr)` | Remove trailing spaces. |
+| `TRIM` | `TRIM([{LEADING\|TRAILING\|BOTH} [remstr] FROM] expr)` | Remove specified characters (default spaces) from string ends. |
+| `SUBSTRING` / `SUBSTR` | `SUBSTRING(expr, pos [, len])` | Extract substring starting at `pos`. 1-based; negative `pos` counts from end. |
+| `SUBSTRING_INDEX` | `SUBSTRING_INDEX(expr, delim, count)` | Substring up to the `count`-th occurrence of `delim`. |
+| `REPLACE` | `REPLACE(expr, from_str, to_str)` | Replace all occurrences of `from_str` with `to_str`. Case-sensitive. |
+| `REPEAT` | `REPEAT(expr, count)` | Repeat string `count` times. |
+| `POSITION` | `POSITION(expr1 IN expr2)` | 1-based position of `expr1` in `expr2`. Returns `0` if not found. |
+| `ASCII` | `ASCII(expr)` | ASCII code of the first character. |
+| `CHAR` | `CHAR(n1 [, n2] ...)` | Characters corresponding to ASCII codes. |
+
+### CAST
+
+```sql
+CAST(expr AS type_name)
+```
+
+Explicit type conversion. Unsupported conversions raise an error. Overflow truncates without error.
+
+```sql
+SELECT CAST(current AS BIGINT) FROM meters;
+SELECT CAST(ts AS VARCHAR(32)) FROM meters;
+```
+
+---
+
+## Time and Date Functions
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `NOW` | `NOW()` | Current client system time. Supports arithmetic: `NOW() + 1h`. |
+| `TODAY` | `TODAY()` | Midnight of current day. |
+| `TIMEZONE` | `TIMEZONE()` | Current client timezone string. |
+| `TIMEDIFF` | `TIMEDIFF(ts1, ts2 [, unit])` | `ts1 - ts2` in specified time unit. |
+| `TIMETRUNCATE` | `TIMETRUNCATE(ts, unit [, use_tz])` | Truncate timestamp to time unit boundary. |
+| `TO_ISO8601` | `TO_ISO8601(ts [, timezone])` | Convert timestamp to ISO 8601 string. |
+| `TO_UNIXTIMESTAMP` | `TO_UNIXTIMESTAMP(str [, return_ts])` | Parse ISO 8601 string to timestamp. |
+| `TO_CHAR` | `TO_CHAR(ts, format_str)` | Format timestamp as string (v3.2.2.0+). |
+| `TO_TIMESTAMP` | `TO_TIMESTAMP(str, format_str)` | Parse string to timestamp using format (v3.2.2.0+). |
+| `DATE` | `DATE(expr)` | Extract date as `yyyy-mm-dd` string (v3.3.8.0+). |
+| `WEEK` | `WEEK(expr [, mode])` | Week number of the year (0–53 depending on mode). |
+| `WEEKDAY` | `WEEKDAY(expr)` | Weekday index: `0`=Monday … `6`=Sunday. |
+| `DAYOFWEEK` | `DAYOFWEEK(expr)` | Weekday: `1`=Sunday … `7`=Saturday. |
+
+**TO_CHAR format tokens:**
+
+| Token | Output |
+|-------|--------|
+| `YYYY` | 4-digit year |
+| `MM` | Month `01`–`12` |
+| `DD` | Day `01`–`31` |
+| `HH24` | Hour `00`–`23` |
+| `MI` | Minute `00`–`59` |
+| `SS` | Second `00`–`59` |
+| `MS` | Millisecond `000`–`999` |
+| `US` | Microsecond `000000`–`999999` |
+| `NS` | Nanosecond `000000000`–`999999999` |
+| `TZH` | Timezone hours offset |
+
+```sql
+SELECT TO_CHAR(ts, 'YYYY-MM-DD HH24:MI:SS.MS') FROM meters;
+SELECT TO_TIMESTAMP('2024-06-01 12:30:00', 'YYYY-MM-DD HH24:MI:SS') FROM meters LIMIT 1;
+```
+
+---
+
+## Control Flow Functions
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `IF` | `IF(cond, val_true, val_false)` | Ternary conditional. |
+| `IFNULL` / `NVL` | `IFNULL(expr1, expr2)` | Return `expr1` if not NULL, else `expr2`. |
+| `NULLIF` | `NULLIF(expr1, expr2)` | Return NULL if `expr1 = expr2`, else `expr1`. |
+| `NVL2` | `NVL2(expr1, expr2, expr3)` | Return `expr2` if `expr1` is not NULL, else `expr3`. |
+
+```sql
+SELECT IF(voltage > 250, 'High', IF(voltage < 200, 'Low', 'Normal')) FROM meters;
+SELECT IFNULL(current, 0.0) FROM meters;
+```
+
+---
+
+## System Information Functions
+
+| Function | Syntax | Description |
+|----------|--------|-------------|
+| `DATABASE` | `SELECT DATABASE()` | Current database name. |
+| `CLIENT_VERSION` | `SELECT CLIENT_VERSION()` | Client library version. |
+| `SERVER_VERSION` | `SELECT SERVER_VERSION()` | TDengine server version. |
+| `SERVER_STATUS` | `SELECT SERVER_STATUS()` | Server health check (returns `1` if healthy). |
+| `CURRENT_USER` | `SELECT CURRENT_USER()` | Current authenticated user. |
+
+---
+
+## Geometry Functions
+
+Supported from v3.1.0.0. Input/output uses WKT (Well-Known Text) format.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `ST_GeomFromText` | `ST_GeomFromText(wkt)` | Create GEOMETRY from WKT string. |
+| `ST_AsText` | `ST_AsText(geom)` | Convert GEOMETRY to WKT string. |
+| `ST_Intersects` | `ST_Intersects(geomA, geomB)` | True if geometries share any point. |
+| `ST_Equals` | `ST_Equals(geomA, geomB)` | True if geometries are spatially equal. |
+| `ST_Touches` | `ST_Touches(geomA, geomB)` | True if boundaries touch but interiors don't. |
+| `ST_Covers` | `ST_Covers(geomA, geomB)` | True if every point of B is inside or on boundary of A. |
+| `ST_Contains` | `ST_Contains(geomA, geomB)` | True if A contains B (interiors must share a point). |
+| `ST_ContainsProperly` | `ST_ContainsProperly(geomA, geomB)` | True if every point of B is strictly inside A (not on boundary). |
+
+```sql
+-- Store and query spatial data
+CREATE TABLE locations (ts TIMESTAMP, pos GEOMETRY(64));
+
+INSERT INTO locations VALUES (NOW,
+  ST_GeomFromText('POINT(116.4 39.9)'));
+
+SELECT ST_AsText(pos) FROM locations WHERE
+  ST_Contains(
+    ST_GeomFromText('POLYGON((116.0 39.0, 117.0 39.0, 117.0 40.0, 116.0 40.0, 116.0 39.0))'),
+    pos
+  );
+```

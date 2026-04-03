@@ -1,0 +1,501 @@
+---
+title: "Deployment"
+description: "Deploy TDengine as a single node or multi-node cluster using manual setup, Docker Compose, or Kubernetes."
+---
+
+TDengine can be deployed on a physical machine, virtual machine, Docker container, or Kubernetes cluster. A single-node deployment suits development and small-scale workloads; a multi-node cluster provides high availability and horizontal scaling for production.
+
+## Hardware and resource planning
+
+Before deploying, estimate the resources required for your workload. The core process `taosd` drives most resource consumption. Supporting processes (`taosAdapter`, `taosKeeper`, `taos-explorer`, `taosX`) each consume roughly one-tenth to a fraction of what `taosd` uses.
+
+### Memory
+
+Memory per database is calculated as:
+
+```
+vgroups × replica × (buffer + pages × pagesize + cachesize)
+```
+
+This total is shared across all dnodes in the cluster. Query the current vnode distribution with:
+
+```sql
+SELECT * FROM information_schema.ins_vnodes;
+```
+
+For native (taosc) client connections, estimate client memory in MB as:
+
+```
+M = (T × S × 3 + (N / 4096) + 100)
+```
+
+Where `T` is the maximum concurrent write threads, `S` is the maximum SQL length (usually 1 MB), and `N` is the total number of subtables. For example, 100 write threads and 10 million subtables requires approximately 2,841 MB (≈ 3 GB).
+
+For WebSocket connections, each concurrent connection uses roughly 8 MB of additional memory. RESTful connections consume more memory because the full result set must be buffered; use WebSocket for large result sets to avoid out-of-memory errors.
+
+<Note>
+Use WebSocket or RESTful connections instead of native taosc connections. They decouple client upgrades from server upgrades, making cluster maintenance easier.
+</Note>
+
+### CPU
+
+CPU needs are determined by three factors:
+
+- **Data sharding**: Each CPU core can serve 1–2 vnodes. A cluster with 100 vgroups and 3-replica replication needs 150–300 CPU cores for optimal performance.
+- **Write throughput**: A single core handles at least 10,000 write requests per second. Writing 200+ rows per request can push a single core to 1 million rows/second.
+- **Query workload**: Query CPU usage varies by SQL complexity and frequency; benchmark with your actual queries.
+
+Keep CPU usage below 50% in production to maintain headroom for spikes.
+
+### Storage
+
+TDengine achieves at least 5× compression in most scenarios. Estimate raw data size as:
+
+```
+RawDataSize = numOfTables × rowSizePerTable × rowsPerTable
+```
+
+For example, 10 million smart meters collecting 20 bytes every 15 minutes generate about 7 TB per year of raw data. TDengine would store this in approximately 1.4 TB.
+
+Use the `keep` parameter to control data retention. TDengine also supports **multi-tier storage**, automatically moving older data from fast storage to cheaper storage without manual migration and without changing SQL query semantics.
+
+To measure the actual compression ratio in your environment:
+
+```bash
+taos> flush database <dbname>;
+$ du -hd1 <dataDir>/vnode --exclude=wal
+```
+
+### Network
+
+For intra-cluster communication, use a dedicated VLAN with 10 Gb/s networking (minimum 1 Gb/s). Keep packet loss below 0.01%.
+
+## Port requirements
+
+Open the following TCP ports on your firewall before deploying:
+
+| Port | Protocol | Component |
+|------|----------|-----------|
+| 6030 | TCP | Native interface (taosc) |
+| 6041 | TCP | RESTful and WebSocket interface (taosAdapter) |
+| 6043 | TCP | taosKeeper |
+| 6044 | TCP/UDP | StatsD format write interface |
+| 6060 | TCP | taosExplorer |
+
+## Single-node deployment
+
+A single dnode runs all components on one machine. This is the simplest setup and requires no cluster configuration.
+
+<Steps>
+  <Step title="Install TDengine">
+    Install the same version of TDengine on your target machine. After installation, all components (`taosd`, `taosAdapter`, `taosKeeper`, `taos-explorer`) are available.
+  </Step>
+  <Step title="Configure taos.cfg">
+    Edit `/etc/taos/taos.cfg`. For a single node, the defaults work for most cases. The critical parameter is `firstEp`, which points to the first dnode endpoint:
+
+    ```shell
+    firstEp h1.tdengine.com:6030
+    fqdn h1.tdengine.com
+    serverPort 6030
+    ```
+  </Step>
+  <Step title="Start the service">
+    ```bash
+    systemctl start taosd
+    systemctl start taosadapter
+    ```
+  </Step>
+  <Step title="Verify the cluster">
+    ```sql
+    taos> show dnodes;
+     id | endpoint             | vnodes | support_vnodes | status |
+    ================================================================
+      1 | h1.tdengine.com:6030 | 0      | 1024           | ready  |
+    ```
+  </Step>
+</Steps>
+
+## Manual cluster deployment
+
+For a production cluster, deploy 3 or more dnodes. All nodes must be able to communicate over TCP on port 6030.
+
+<Steps>
+  <Step title="Check network connectivity">
+    On each node, verify that hostnames are unique and reachable:
+
+    ```bash
+    hostname -f
+    ping h2.tdengine.com
+    ```
+
+    Fix `/etc/hosts` or DNS if any node cannot ping another.
+  </Step>
+  <Step title="Install TDengine on all nodes">
+    Install the same TDengine version on every physical node.
+  </Step>
+  <Step title="Configure all nodes">
+    Set these parameters consistently across all nodes. The `firstEp` must point to the same initial dnode on every node; only `fqdn` differs per node:
+
+    ```shell
+    firstEp h1.tdengine.com:6030
+    fqdn h1.tdengine.com   # change to this node's FQDN
+    serverPort 6030
+    ```
+
+    The following parameters must match exactly across all nodes or a dnode will fail to join the cluster:
+
+    | Parameter | Description |
+    |-----------|-------------|
+    | `statusInterval` | Interval for dnode to report status to mnode |
+    | `timezone` | Time zone |
+    | `locale` | System locale and encoding |
+    | `charset` | Character set encoding |
+    | `ttlChangeOnWrite` | Whether TTL expiration updates on write |
+  </Step>
+  <Step title="Start the first dnode">
+    Start `taosd` on `h1.tdengine.com` first. Verify it is running:
+
+    ```bash
+    systemctl start taosd
+    taos -s "show dnodes"
+    ```
+  </Step>
+  <Step title="Add additional dnodes">
+    Start `taosd` on each additional node, then register it from the first node:
+
+    ```sql
+    create dnode "h2.tdengine.com:6030";
+    create dnode "h3.tdengine.com:6030";
+    show dnodes;
+    ```
+  </Step>
+  <Step title="Create mnodes for high availability">
+    A cluster can have up to 3 mnodes. Create additional mnodes when you have 3 or more dnodes:
+
+    ```sql
+    create mnode on dnode 2;
+    create mnode on dnode 3;
+    show mnodes;
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+If a new dnode stays offline after `create dnode`, stop `taosd` on that node, clear the `dataDir` directory, then restart `taosd`. This resets the node to an unconfigured state so it can join the cluster.
+</Warning>
+
+### Deploying multiple taosAdapter instances
+
+For higher throughput and availability, deploy multiple taosAdapter instances behind Nginx:
+
+```nginx
+user root;
+worker_processes auto;
+
+events {
+    use epoll;
+    worker_connections 1024;
+}
+
+http {
+    access_log off;
+
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    server {
+        listen 6041;
+        location ~* {
+            proxy_pass http://dbserver;
+            proxy_read_timeout 600s;
+            proxy_send_timeout 600s;
+            proxy_connect_timeout 600s;
+            proxy_next_upstream error http_502 non_idempotent;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $http_connection;
+        }
+    }
+
+    upstream dbserver {
+        least_conn;
+        server 172.16.214.201:6041 max_fails=0;
+        server 172.16.214.202:6041 max_fails=0;
+        server 172.16.214.203:6041 max_fails=0;
+    }
+}
+```
+
+## Docker Compose for multi-node setup
+
+Use Docker Compose to run a 3-node TDengine cluster locally or in a containerized environment.
+
+```yaml
+services:
+  td1:
+    image: tdengine/tsdb-ee
+    environment:
+      - TAOS_FQDN=td1
+
+  td2:
+    image: tdengine/tsdb-ee
+    environment:
+      - TAOS_FQDN=td2
+      - TAOS_FIRST_EP=td1:6030
+
+  td3:
+    image: tdengine/tsdb-ee
+    environment:
+      - TAOS_FQDN=td3
+      - TAOS_FIRST_EP=td1:6030
+```
+
+`TAOS_FIRST_EP` is equivalent to the `firstEp` parameter in `taos.cfg`. All nodes except the first must set it to the first node's endpoint.
+
+<Steps>
+  <Step title="Start the cluster">
+    ```bash
+    docker compose up -d
+    ```
+  </Step>
+  <Step title="Verify all nodes joined">
+    ```bash
+    docker compose exec td1 taos -s "show dnodes"
+    ```
+
+    Expected output showing 3 ready nodes:
+
+    ```text
+    id | endpoint   | vnodes | support_vnodes | status |
+    =====================================================
+     1 | td1:6030   | 0      | 85             | ready  |
+     2 | td2:6030   | 1      | 85             | ready  |
+     3 | td3:6030   | 0      | 85             | ready  |
+    ```
+  </Step>
+</Steps>
+
+<Note>
+After version 3.3.6.0, the default `fqdn` changed from `buildkitsandbox` to `localhost`. If you are upgrading an existing deployment, set `-e TAOS_FQDN=<old_value>` to match the previous FQDN, or the container may fail to start.
+</Note>
+
+## Kubernetes deployment
+
+TDengine supports Kubernetes natively. For a highly available production cluster, you need at least 3 dnodes, 3 mnodes, and 3 database replicas.
+
+### Service definition
+
+Create `taosd-service.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: "taosd"
+  labels:
+    app: "tdengine"
+spec:
+  ports:
+    - name: tcp6030
+      protocol: "TCP"
+      port: 6030
+    - name: tcp6041
+      protocol: "TCP"
+      port: 6041
+  selector:
+    app: "tdengine"
+```
+
+### StatefulSet definition
+
+Create `tdengine.yaml` with 3 replicas and pod anti-affinity to spread pods across nodes:
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: "tdengine"
+  labels:
+    app: "tdengine"
+spec:
+  serviceName: "taosd"
+  replicas: 3
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: "tdengine"
+  template:
+    metadata:
+      name: "tdengine"
+      labels:
+        app: "tdengine"
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - tdengine
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: "tdengine"
+          image: "tdengine/tdengine:3.2.3.0"
+          ports:
+            - name: tcp6030
+              protocol: "TCP"
+              containerPort: 6030
+            - name: tcp6041
+              protocol: "TCP"
+              containerPort: 6041
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SERVICE_NAME
+              value: "taosd"
+            - name: STS_NAME
+              value: "tdengine"
+            - name: STS_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: TZ
+              value: "Asia/Shanghai"
+            - name: TAOS_SERVER_PORT
+              value: "6030"
+            - name: TAOS_FIRST_EP
+              value: "$(STS_NAME)-0.$(SERVICE_NAME).$(STS_NAMESPACE).svc.cluster.local:$(TAOS_SERVER_PORT)"
+            - name: TAOS_FQDN
+              value: "$(POD_NAME).$(SERVICE_NAME).$(STS_NAMESPACE).svc.cluster.local"
+          volumeMounts:
+            - name: taosdata
+              mountPath: /var/lib/taos
+          startupProbe:
+            exec:
+              command:
+                - taos-check
+                - startup
+            failureThreshold: 360
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command:
+                - taos-check
+                - service
+            initialDelaySeconds: 5
+            timeoutSeconds: 5000
+          livenessProbe:
+            exec:
+              command:
+                - taos-check
+                - service
+            initialDelaySeconds: 15
+            periodSeconds: 20
+  volumeClaimTemplates:
+    - metadata:
+        name: taosdata
+      spec:
+        accessModes:
+          - "ReadWriteOnce"
+        storageClassName: "standard"
+        resources:
+          requests:
+            storage: "5Gi"
+```
+
+<Note>
+`taos-check startup` and `taos-check service` are available in version 3.4.1.0 and later. `taos-check service` authenticates using `TAOS_ROOT_PASSWORD` or `TAOS_ROOT_PASSWORD_FILE`. If you change the root password, update these environment variables before restarting the Pod.
+</Note>
+
+<Steps>
+  <Step title="Apply the manifests">
+    ```bash
+    kubectl apply -f taosd-service.yaml -n tdengine-test
+    kubectl apply -f tdengine.yaml -n tdengine-test
+    ```
+  </Step>
+  <Step title="Verify the cluster">
+    ```bash
+    kubectl exec -it tdengine-0 -n tdengine-test -- taos -s "show dnodes"
+    ```
+  </Step>
+  <Step title="Create additional mnodes">
+    ```bash
+    kubectl exec -it tdengine-0 -n tdengine-test -- taos -s "create mnode on dnode 2"
+    kubectl exec -it tdengine-0 -n tdengine-test -- taos -s "create mnode on dnode 3"
+    ```
+  </Step>
+  <Step title="Expose the REST/WebSocket port">
+    ```bash
+    kubectl port-forward -n tdengine-test tdengine-0 6041:6041 &
+    curl -u root:taosdata -d "show databases" 127.0.0.1:6041/rest/sql
+    ```
+  </Step>
+</Steps>
+
+To scale the cluster, update the replica count:
+
+```bash
+kubectl scale statefulsets tdengine -n tdengine-test --replicas=4
+```
+
+### Helm deployment
+
+TDengine provides a Helm chart for more complex deployments. Download the chart and install it with a `values.yaml` file:
+
+```bash
+wget https://github.com/taosdata/TDengine-Operator/raw/refs/heads/3.0/helm/tdengine-3.5.0.tgz
+helm install tdengine tdengine-3.5.0.tgz -f values.yaml
+```
+
+A minimal `values.yaml` for a single-node deployment:
+
+```yaml
+name: "tdengine"
+
+image:
+  repository: ""
+  server: tdengine/tdengine:latest
+
+timezone: "Asia/Shanghai"
+
+services:
+  server:
+    type: ClusterIP
+    replica: 1
+    ports:
+      tcp: [6041, 6030, 6060]
+    volumes:
+      - name: data
+        mountPath: /var/lib/taos
+        spec:
+          storageClassName: "local-path"
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: "10Gi"
+      - name: log
+        mountPath: /var/log/taos/
+        spec:
+          storageClassName: "local-path"
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: "10Gi"
+```
+
+To clean up a Helm release:
+
+```bash
+helm uninstall tdengine
+kubectl delete pvc -l app.kubernetes.io/instance=tdengine
+```

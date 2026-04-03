@@ -1,0 +1,290 @@
+---
+title: "Data Model"
+description: "Understand how TDengine structures time-series data using metrics, tags, supertables, and the one-table-per-device design."
+---
+
+TDengine uses smart meters as a running example throughout its documentation. Each smart meter collects three metrics — current, voltage, and phase — and has two static attributes: location and group ID.
+
+| Device ID | Timestamp     | Current | Voltage | Phase | Location                | Group ID |
+|:---------:|:-------------:|:-------:|:-------:|:-----:|:-----------------------:|:--------:|
+| d1001     | 1538548685000 | 10.3    | 219     | 0.31  | California.SanFrancisco | 2        |
+| d1002     | 1538548684000 | 10.2    | 220     | 0.23  | California.SanFrancisco | 3        |
+| d1003     | 1538548686500 | 11.5    | 221     | 0.35  | California.LosAngeles   | 3        |
+| d1004     | 1538548685500 | 13.4    | 223     | 0.29  | California.LosAngeles   | 2        |
+
+## Core concepts
+
+### Metrics
+
+A **metric** is a physical quantity collected from a sensor or device — for example, current, voltage, or temperature. Metrics change over time and can be integers, floating-point numbers, strings, or other types. As time passes, the volume of metric data grows continuously.
+
+### Tags
+
+A **tag** is a static attribute of a device or sensor, such as its model, color, or location. Tags do not change with each measurement. Although tags themselves are static, you can add, modify, or delete them. Unlike metrics, the total volume of tag data stays relatively stable over time.
+
+In the smart meter example, `location` and `group_id` are tags.
+
+### Data collection points
+
+A **data collection point (DCP)** is a hardware or software device that collects metrics at a preset interval or on a triggering event. A DCP can collect multiple metrics simultaneously — all with the same timestamp.
+
+Complex devices may contain multiple DCPs, each with its own collection frequency. For example, a car might have one DCP for GPS location, one for engine status, and one for the cabin environment. In the smart meter example, device identifiers such as `d1001`, `d1002`, and `d1003` each represent a distinct DCP.
+
+### Tables
+
+TDengine uses the **one-table-per-device** design: each DCP gets its own table. The device name (for example, `d1001`) is used as the table name, and each metric becomes a column. The first column must always be a timestamp.
+
+This design provides four key advantages over storing multiple devices in a shared table:
+
+1. **Lock-free writes** — each table has exactly one writer, so no locking is needed, dramatically increasing write throughput.
+2. **Append-only writes** — data from a single DCP arrives in chronological order, enabling sequential writes.
+3. **Contiguous storage** — data from one DCP is stored together on disk, minimizing random reads during queries.
+4. **Higher compression** — columnar storage within data blocks allows per-type compression algorithms; slowly changing sensor data compresses particularly well.
+
+### Supertables
+
+As the number of devices grows, managing thousands or millions of individual tables becomes unwieldy. TDengine solves this with the **supertable** (STable).
+
+A supertable is a logical template that groups DCPs of the same type. It defines:
+- A timestamp column (required, must be first)
+- One or more metric columns
+- One or more tag columns
+
+A supertable does not store data itself. Data lives in **subtables** — one per device — which inherit the supertable's schema. You can query a supertable to aggregate across all its subtables, with TDengine automatically filtering by tags and merging results.
+
+<Note>
+Modifying the columns or tags of a supertable takes effect immediately across all its subtables. You cannot modify a subtable's schema directly.
+</Note>
+
+### Subtables
+
+A subtable is a concrete table belonging to a supertable. You create it by specifying tag values for a particular device. The relationship between supertable and subtables:
+
+- Multiple subtables share the same schema but have different tag values.
+- A supertable defines the template; subtables store the actual data.
+- A supertable does not hold any data or tag values itself.
+
+### Virtual tables
+
+The one-table-per-device model handles most IoT scenarios, but some devices have sensors with different collection frequencies. For example, a wind turbine might have electrical, environmental, and mechanical sensors each sampling at different rates. Combining them into one table would produce many NULL values.
+
+TDengine introduces **virtual tables (VTables)** to solve this. A virtual table is a logical entity that does not store physical data but dynamically combines columns from multiple source tables by aligning on timestamps. Missing values are filled with NULL.
+
+Virtual tables come in two forms:
+
+<CardGroup cols={2}>
+  <Card title="Single-source aggregation" icon="layer-group">
+    Combine multiple single-column tables for the same device into one unified view. For example, merge `current_d1001`, `voltage_d1001`, and `phase_d1001` into a single virtual subtable.
+  </Card>
+  <Card title="Cross-source comparison" icon="arrows-left-right">
+    Align the same metric from multiple devices side by side. For example, compare current readings from `d1001`, `d1002`, `d1003`, and `d1004` in a single virtual table.
+  </Card>
+</CardGroup>
+
+<Info>
+Virtual tables are read-only. You can query them like physical tables, but you cannot write to or delete from them. Their data is generated dynamically at query time.
+</Info>
+
+### Databases
+
+A **database** in TDengine is a container for a collection of tables and supertables. A single TDengine instance can host multiple databases, each with its own storage configuration — including timestamp precision, data retention period, number of replicas, and block size.
+
+Because different device types often have different data characteristics (collection frequency, retention needs, etc.), it is best practice to create separate databases for different types of DCPs.
+
+Each supertable belongs to exactly one database, and all subtables of a supertable are stored in that same database.
+
+### Timestamps
+
+TDengine always stores timestamps as UTC. When writing data, the client converts local timestamps to UTC based on the application's configured time zone. When reading data, the client converts UTC timestamps back to local time.
+
+TDengine supports two timestamp input formats:
+
+- **RFC-3339** (e.g., `2018-10-03T14:38:05.000+08:00`) — includes explicit time zone information.
+- **Non-RFC-3339** (e.g., `2018-10-03 14:38:05`) — interpreted using the application's configured time zone.
+
+## Data modeling with SQL
+
+This section shows how to create a database, supertable, and subtables for the smart meter scenario.
+
+### Creating a database
+
+```sql
+CREATE DATABASE power PRECISION 'ms' KEEP 3650 DURATION 10 BUFFER 16;
+```
+
+| Parameter   | Value | Meaning                                            |
+|:-----------:|:-----:|:--------------------------------------------------:|
+| `PRECISION` | `ms`  | Millisecond timestamp precision                    |
+| `KEEP`      | 3650  | Retain data for 3650 days; older data is deleted   |
+| `DURATION`  | 10    | Store 10 days of data per file                     |
+| `BUFFER`    | 16    | Write memory pool size: 16 MB                      |
+
+Switch to the new database:
+
+```sql
+USE power;
+```
+
+### Creating a supertable
+
+```sql
+CREATE STABLE meters (
+    ts        timestamp,
+    current   float,
+    voltage   int,
+    phase     float
+) TAGS (
+    location  varchar(64),
+    group_id  int
+);
+```
+
+Rules to follow when defining a supertable:
+
+1. The first column must be a `timestamp` column.
+2. Subsequent columns define the metrics. Supported types include integer, float, string, and more.
+3. Tag names must differ from metric column names.
+4. Tag values identify individual devices and are stored separately from metric data.
+
+### Creating a subtable
+
+```sql
+CREATE TABLE d1001
+USING meters (location, group_id)
+TAGS ("California.SanFrancisco", 2);
+```
+
+This creates subtable `d1001` using `meters` as a template, with `location` set to `California.SanFrancisco` and `group_id` set to `2`.
+
+### Auto-creating tables on insert
+
+You can let TDengine create a subtable automatically when you first insert data into it:
+
+```sql
+INSERT INTO d1002
+USING meters
+TAGS ("California.SanFrancisco", 2)
+VALUES (NOW, 10.2, 219, 0.32);
+```
+
+If `d1002` does not yet exist, TDengine creates it with the specified tags and then inserts the row. If it already exists, TDengine inserts the row directly.
+
+### Creating a basic table (no supertable)
+
+For cases where you do not need supertable-based aggregation, you can create a standalone table:
+
+```sql
+CREATE TABLE d1003 (
+    ts        timestamp,
+    current   float,
+    voltage   int,
+    phase     float,
+    location  varchar(64),
+    group_id  int
+);
+```
+
+<Warning>
+With basic tables, static attributes like `location` and `group_id` are stored in every row. This wastes storage and significantly reduces query performance compared to using a supertable, because TDengine cannot use tag indexes for filtering.
+</Warning>
+
+## Multi-column vs. single-column models
+
+TDengine supports two approaches for structuring your supertables:
+
+<Tabs>
+  <Tab title="Multi-column model (recommended)">
+    All metrics collected at the same time from the same DCP go into one supertable as separate columns. This is what the `meters` supertable above demonstrates.
+
+    **Advantages:**
+    - Better write throughput (one insert covers all metrics)
+    - Higher compression (correlated metrics compress together)
+    - Simpler queries (no joins needed)
+  </Tab>
+  <Tab title="Single-column model">
+    Each metric gets its own supertable. For smart meters, you would create `current_stb`, `voltage_stb`, and `phase_stb` separately.
+
+    ```sql
+    CREATE STABLE current_stb (
+        ts      timestamp,
+        current float
+    ) TAGS (
+        device_id varchar(64),
+        location  varchar(64),
+        group_id  int
+    );
+
+    CREATE STABLE voltage_stb (
+        ts      timestamp,
+        voltage int
+    ) TAGS (
+        device_id varchar(64),
+        location  varchar(64),
+        group_id  int
+    );
+
+    CREATE STABLE phase_stb (
+        ts    timestamp,
+        phase float
+    ) TAGS (
+        device_id varchar(64),
+        location  varchar(64),
+        group_id  int
+    );
+    ```
+
+    **When to use:**
+    - The set of metrics for a DCP changes frequently
+    - Different metrics need very different retention or precision settings
+  </Tab>
+</Tabs>
+
+## Virtual tables for cross-table analysis
+
+When using the single-column model, you can use virtual tables to reconstruct a unified per-device view.
+
+### Single-source multi-dimensional aggregation
+
+Create a virtual supertable that combines the three single-column supertables:
+
+```sql
+CREATE STABLE meters_v (
+    ts      timestamp,
+    current float,
+    voltage int,
+    phase   float
+) TAGS (
+    location varchar(64),
+    group_id int
+) VIRTUAL 1;
+```
+
+Then create virtual subtables that map each metric column to its source:
+
+```sql
+CREATE VTABLE d1001_v (
+    current FROM current_d1001.current,
+    voltage FROM voltage_d1001.voltage,
+    phase   FROM phase_d1001.phase
+)
+USING meters_v
+TAGS ("California.SanFrancisco", 2);
+```
+
+When you query `d1001_v`, TDengine aligns rows by timestamp. Rows that exist in one source table but not another are filled with NULL.
+
+### Cross-source metric comparison
+
+To compare the same metric across multiple devices in one query, create a regular virtual table:
+
+```sql
+CREATE VTABLE current_v (
+    ts             TIMESTAMP,
+    d1001_current  FLOAT FROM current_d1001.current,
+    d1002_current  FLOAT FROM current_d1002.current,
+    d1003_current  FLOAT FROM current_d1003.current,
+    d1004_current  FLOAT FROM current_d1004.current
+);
+```
+
+Querying `current_v` returns a side-by-side timestamp-aligned view of current readings from all four devices, with NULL where a device has no reading at a given timestamp.

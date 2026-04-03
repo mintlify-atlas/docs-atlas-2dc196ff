@@ -1,0 +1,514 @@
+---
+title: "Go Client Library"
+description: "Reference for driver-go: connecting, executing queries, schemaless insert, parameter binding, and TMQ data subscription using WebSocket and native connections."
+---
+
+`driver-go` is the official Go connector for TDengine. It implements the `database/sql/driver` interface, so you can use the standard `database/sql` package with TDengine. It also provides extended interfaces for schemaless writes, STMT2 parameter binding, and TMQ data subscriptions.
+
+<Warning>
+Go native connections (`taosSql` driver) and REST connections are **deprecated** and will be discontinued on **2027-01-01**. Migrate to WebSocket using the `taosWS` driver or the `ws/unified` package.
+</Warning>
+
+## Requirements
+
+Go 1.14 and above.
+
+## Installation
+
+```bash
+go get github.com/taosdata/driver-go/v3@latest
+```
+
+## Connection modes
+
+<Tabs>
+  <Tab title="WebSocket — database/sql (recommended)">
+    Use the `taosWS` driver with the standard `database/sql` package:
+
+    ```go
+    import (
+        "database/sql"
+        "fmt"
+        "log"
+
+        _ "github.com/taosdata/driver-go/v3/taosWS"
+    )
+
+    func main() {
+        dsn := "root:taosdata@ws(localhost:6041)/"
+        db, err := sql.Open("taosWS", dsn)
+        if err != nil {
+            log.Fatalln("Failed to connect:", err)
+        }
+        defer db.Close()
+        fmt.Println("Connected via WebSocket")
+    }
+    ```
+  </Tab>
+  <Tab title="WebSocket — ws/unified">
+    The `ws/unified` package (v3.8.0+) provides a single client for SQL, schemaless, and STMT2 writes over WebSocket:
+
+    ```go
+    import (
+        "fmt"
+        "log"
+
+        "github.com/taosdata/driver-go/v3/ws/unified"
+    )
+
+    func main() {
+        dsn := "root:taosdata@ws(localhost:6041)/"
+        client, err := unified.Open(dsn)
+        if err != nil {
+            log.Fatalln("Failed to connect:", err)
+        }
+        defer client.Close()
+        fmt.Println("Connected via ws/unified")
+    }
+    ```
+  </Tab>
+  <Tab title="Native (deprecated)">
+    ```go
+    import (
+        "database/sql"
+        "fmt"
+        "log"
+
+        _ "github.com/taosdata/driver-go/v3/taosSql"
+    )
+
+    func main() {
+        dsn := "root:taosdata@tcp(localhost:6030)/"
+        db, err := sql.Open("taosSql", dsn)
+        if err != nil {
+            log.Fatalln("Failed to connect:", err)
+        }
+        defer db.Close()
+        fmt.Println("Connected via native")
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## DSN format
+
+```text
+username:password@protocol(address)/[dbname][?param1=value1&...]
+```
+
+Examples:
+
+```text
+root:taosdata@ws(localhost:6041)/
+root:taosdata@ws(localhost:6041)/power
+root:taosdata@ws(node1:6041,node2:6041)/power?autoReconnect=true
+root:taosdata@tcp(localhost:6030)/
+```
+
+For IPv6 addresses, wrap the address in square brackets:
+
+```text
+root:taosdata@ws([::1]:6041)/power
+```
+
+### WebSocket DSN parameters
+
+| Parameter | Description | Default |
+|---|---|---|
+| `enableCompression` | Compress data during transfer | `false` |
+| `readTimeout` | Timeout for reading data | `5m` |
+| `writeTimeout` | Timeout for writing data | `10s` |
+| `timezone` | IANA timezone (URL-encoded) | local |
+| `token` | Cloud service token | — |
+| `bearerToken` | Bearer token for authentication | — |
+| `autoReconnect` | Enable automatic reconnect (v3.8.0+) | `false` |
+| `reconnectIntervalMs` | Reconnect interval (ms) | `2000` |
+| `reconnectRetryCount` | Max reconnect attempts | `3` |
+
+## Executing SQL
+
+### db.Exec — for DDL and DML
+
+```go
+package main
+
+import (
+    "database/sql"
+    "fmt"
+    "log"
+
+    _ "github.com/taosdata/driver-go/v3/taosWS"
+)
+
+func main() {
+    db, err := sql.Open("taosWS", "root:taosdata@ws(localhost:6041)/")
+    if err != nil {
+        log.Fatalln(err)
+    }
+    defer db.Close()
+
+    // Create database and supertable
+    _, err = db.Exec("CREATE DATABASE IF NOT EXISTS power")
+    if err != nil {
+        log.Fatalln("Create DB:", err)
+    }
+    _, err = db.Exec(`CREATE STABLE IF NOT EXISTS power.meters
+        (ts TIMESTAMP, current FLOAT, voltage INT, phase FLOAT)
+        TAGS (groupId INT, location BINARY(24))`)
+    if err != nil {
+        log.Fatalln("Create stable:", err)
+    }
+
+    // Insert data
+    insertSQL := `INSERT INTO
+        power.d1001 USING power.meters TAGS(2,'California.SanFrancisco')
+        VALUES
+        (NOW + 1a, 10.30000, 219, 0.31000)
+        (NOW + 2a, 12.60000, 218, 0.33000)
+        power.d1002 USING power.meters TAGS(3, 'California.SanFrancisco')
+        VALUES
+        (NOW + 1a, 10.30000, 218, 0.25000)`
+
+    res, err := db.Exec(insertSQL)
+    if err != nil {
+        log.Fatalln("Insert:", err)
+    }
+    rowsAffected, _ := res.RowsAffected()
+    fmt.Printf("Inserted %d rows\n", rowsAffected)
+}
+```
+
+### db.Query — for SELECT
+
+```go
+package main
+
+import (
+    "database/sql"
+    "fmt"
+    "log"
+    "time"
+
+    _ "github.com/taosdata/driver-go/v3/taosWS"
+)
+
+func main() {
+    db, err := sql.Open("taosWS", "root:taosdata@ws(localhost:6041)/")
+    if err != nil {
+        log.Fatalln(err)
+    }
+    defer db.Close()
+
+    rows, err := db.Query(
+        "SELECT ts, current, location FROM power.meters LIMIT 100")
+    if err != nil {
+        log.Fatalln("Query:", err)
+    }
+    defer rows.Close()
+
+    for rows.Next() {
+        var (
+            ts       time.Time
+            current  float32
+            location string
+        )
+        if err := rows.Scan(&ts, &current, &location); err != nil {
+            log.Fatalln("Scan:", err)
+        }
+        fmt.Printf("ts=%s  current=%.2f  location=%s\n", ts, current, location)
+    }
+    if err := rows.Err(); err != nil {
+        log.Fatalln("Rows error:", err)
+    }
+}
+```
+
+### db.QueryRow — for a single row
+
+```go
+var count int64
+err := db.QueryRow("SELECT COUNT(*) FROM power.meters").Scan(&count)
+if err != nil {
+    log.Fatalln(err)
+}
+fmt.Printf("Total rows: %d\n", count)
+```
+
+## Data type mapping
+
+| TDengine type | Go type |
+|---|---|
+| TIMESTAMP | `time.Time` |
+| TINYINT | `int8` |
+| SMALLINT | `int16` |
+| INT | `int32` |
+| BIGINT | `int64` |
+| TINYINT UNSIGNED | `uint8` |
+| SMALLINT UNSIGNED | `uint16` |
+| INT UNSIGNED | `uint32` |
+| BIGINT UNSIGNED | `uint64` |
+| FLOAT | `float32` |
+| DOUBLE | `float64` |
+| BOOL | `bool` |
+| BINARY / NCHAR / VARCHAR | `string` |
+| JSON | `[]byte` |
+| VARBINARY / GEOMETRY | `[]byte` |
+| DECIMAL | `string` |
+| BLOB | `[]byte` |
+
+## Error handling
+
+```go
+import "github.com/taosdata/driver-go/v3/errors"
+
+_, err := db.Exec("SELECT * FROM nonexistent")
+if err != nil {
+    if tErr, ok := err.(*errors.TaosError); ok {
+        fmt.Printf("TDengine error code: %d\n", int(tErr.Code))
+        fmt.Printf("TDengine error msg:  %s\n", tErr.ErrStr)
+    } else {
+        fmt.Println("Other error:", err)
+    }
+}
+```
+
+## Schemaless insert
+
+Use the `ws/unified` package for schemaless writes over WebSocket (v3.8.0+):
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+
+    "github.com/taosdata/driver-go/v3/common"
+    "github.com/taosdata/driver-go/v3/ws/unified"
+)
+
+func main() {
+    client, err := unified.Open("root:taosdata@ws(localhost:6041)/")
+    if err != nil {
+        log.Fatalln(err)
+    }
+    defer client.Close()
+
+    _, err = client.Exec(common.GetReqID(), "CREATE DATABASE IF NOT EXISTS power")
+    if err != nil {
+        log.Fatalln(err)
+    }
+    _, err = client.Exec(common.GetReqID(), "USE power")
+    if err != nil {
+        log.Fatalln(err)
+    }
+
+    // InfluxDB Line Protocol
+    lineData := "meters,groupid=2,location=California.SanFrancisco " +
+        "current=10.3000002f64,voltage=219i32,phase=0.31f64 1626006833639"
+    err = client.SchemalessInsert(
+        common.GetReqID(), lineData,
+        unified.InfluxDBLineProtocol, "ms", 0, "")
+    if err != nil {
+        log.Fatalln("Line protocol insert:", err)
+    }
+
+    // OpenTSDB Telnet Protocol
+    telnetData := "metric_telnet 1707095283260 4 host=host0 interface=eth0"
+    err = client.SchemalessInsert(
+        common.GetReqID(), telnetData,
+        unified.OpenTSDBTelnetLineProtocol, "ms", 0, "")
+    if err != nil {
+        log.Fatalln("Telnet protocol insert:", err)
+    }
+
+    // OpenTSDB JSON Protocol
+    jsonData := `{"metric":"metric_json","timestamp":1626846400,"value":10.3,` +
+        `"tags":{"groupid":2,"location":"California.SanFrancisco","id":"d1001"}}`
+    err = client.SchemalessInsert(
+        common.GetReqID(), jsonData,
+        unified.OpenTSDBJsonFormatProtocol, "s", 0, "")
+    if err != nil {
+        log.Fatalln("JSON protocol insert:", err)
+    }
+
+    fmt.Println("Schemaless inserts completed successfully")
+}
+```
+
+For native connections, use the `af` package:
+
+```go
+import "github.com/taosdata/driver-go/v3/af"
+
+conn, err := af.Open("localhost", "root", "taosdata", "power", 6030)
+if err != nil {
+    log.Fatalln(err)
+}
+defer conn.Close()
+
+err = conn.InfluxDBInsertLines([]string{lineData}, "ms")
+```
+
+## Parameter binding (STMT2)
+
+The `ws/unified` package provides STMT2 parameter binding for high-throughput writes:
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+    "time"
+
+    "github.com/taosdata/driver-go/v3/common"
+    "github.com/taosdata/driver-go/v3/common/stmt"
+    "github.com/taosdata/driver-go/v3/ws/unified"
+)
+
+func main() {
+    client, err := unified.Open("root:taosdata@ws(localhost:6041)/")
+    if err != nil {
+        log.Fatalln(err)
+    }
+    defer client.Close()
+
+    // Initialize STMT2 handle
+    stmtHandle, err := client.InitStmt(common.GetReqID())
+    if err != nil {
+        log.Fatalln("InitStmt:", err)
+    }
+
+    // Prepare INSERT template
+    err = stmtHandle.Prepare(common.GetReqID(),
+        "INSERT INTO ? USING power.meters TAGS(?,?) VALUES (?,?,?,?)")
+    if err != nil {
+        log.Fatalln("Prepare:", err)
+    }
+
+    // Build bind data
+    now := time.Now()
+    bindData := []*stmt.TaosStmt2BindData{
+        {
+            TableName: "d1001",
+            Tags: []driver.Value{int32(1), "California.SanJose"},
+            Cols: [][]driver.Value{
+                {now.UnixMilli(), now.Add(time.Second).UnixMilli()},
+                {float32(10.3), float32(12.6)},
+                {int32(219), int32(218)},
+                {float32(0.31), float32(0.33)},
+            },
+        },
+    }
+
+    err = stmtHandle.Bind(bindData)
+    if err != nil {
+        log.Fatalln("Bind:", err)
+    }
+
+    affected, err := stmtHandle.Exec(common.GetReqID())
+    if err != nil {
+        log.Fatalln("Exec:", err)
+    }
+    fmt.Printf("Inserted %d rows\n", affected)
+
+    stmtHandle.Close(common.GetReqID())
+}
+```
+
+## TMQ data subscription
+
+Subscribe to a TDengine topic to consume data change streams:
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+
+    "github.com/taosdata/driver-go/v3/common"
+    tmqcommon "github.com/taosdata/driver-go/v3/common/tmq"
+    "github.com/taosdata/driver-go/v3/ws/tmq"
+)
+
+func main() {
+    consumer, err := tmq.NewConsumer(&tmqcommon.ConfigMap{
+        "ws.url":                  "ws://127.0.0.1:6041",
+        "td.connect.user":         "root",
+        "td.connect.pass":         "taosdata",
+        "group.id":                "my-group",
+        "client.id":               "my-client",
+        "auto.offset.reset":       "latest",
+        "enable.auto.commit":      "true",
+        "auto.commit.interval.ms": "1000",
+        "msg.with.table.name":     "true",
+    })
+    if err != nil {
+        log.Fatalln("NewConsumer:", err)
+    }
+
+    err = consumer.Subscribe("topic_meters", nil)
+    if err != nil {
+        log.Fatalln("Subscribe:", err)
+    }
+    log.Println("Subscribed to topic_meters")
+
+    for i := 0; i < 50; i++ {
+        ev := consumer.Poll(100)
+        if ev == nil {
+            continue
+        }
+        switch e := ev.(type) {
+        case *tmqcommon.DataMessage:
+            fmt.Printf("Received message: %v\n", e)
+            // Manually commit offset
+            _, err = consumer.CommitOffsets([]tmqcommon.TopicPartition{
+                e.TopicPartition,
+            })
+            if err != nil {
+                log.Println("CommitOffsets:", err)
+            }
+        case tmqcommon.Error:
+            log.Println("Consumer error:", e)
+        }
+    }
+
+    consumer.Unsubscribe()
+    consumer.Close()
+}
+```
+
+## Multi-endpoint failover (v3.8.0+)
+
+```go
+// Specify multiple endpoints in the DSN for failover and load balancing
+dsn := "root:taosdata@ws(node1:6041,node2:6041)/power?autoReconnect=true&reconnectRetryCount=10"
+db, err := sql.Open("taosWS", dsn)
+```
+
+Or with `ws/unified`:
+
+```go
+client, err := unified.Open(
+    "root:taosdata@ws(node1:6041,node2:6041)/power?autoReconnect=true")
+```
+
+<Note>
+After a reconnect, the current database selected in the connection is reset. Always specify the database in the DSN and avoid using `USE db` statements if you rely on auto-reconnect.
+</Note>
+
+## Frequently asked questions
+
+**`[0x217] Database not specified or available` after `USE db`**
+
+The REST interface is stateless; `USE db` has no effect. Specify the database in the DSN or use fully qualified table names like `power.meters`.
+
+**`go get` times out**
+
+Set the Go module proxy: `go env -w GOPROXY=https://goproxy.cn,direct`.
+
+**Query timezone handling**
+
+For WebSocket and native connections, `time.Time` values returned from queries are in the local timezone by default. Use the `timezone` DSN parameter to override (URL-encode the value: `timezone=Asia%2FShanghai`).

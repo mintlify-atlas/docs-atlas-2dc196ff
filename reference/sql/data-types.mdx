@@ -1,0 +1,243 @@
+---
+title: "Data Types"
+description: "Complete reference for all data types supported in TDengine, including numeric, string, binary, timestamp, and boolean types with ranges and limits."
+---
+
+## Timestamp
+
+Every table in TDengine must have a `TIMESTAMP` primary key as its first column. Timestamps are fundamental to all time-series operations.
+
+**Timestamp format:** `YYYY-MM-DD HH:mm:ss.MS`  
+Default resolution is milliseconds. Example: `2017-08-12 18:25:58.128`
+
+**Precision is set at database creation:**
+
+```sql
+CREATE DATABASE db_name PRECISION 'ms'; -- milliseconds (default)
+CREATE DATABASE db_name PRECISION 'us'; -- microseconds
+CREATE DATABASE db_name PRECISION 'ns'; -- nanoseconds
+```
+
+**Time arithmetic:** Use relative expressions like `NOW - 2h` (last 2 hours).
+
+| Unit | Symbol | Example |
+|------|--------|---------|
+| Nanoseconds | `b` | `NOW - 500b` |
+| Microseconds | `u` | `NOW - 1000u` |
+| Milliseconds | `a` | `NOW - 500a` |
+| Seconds | `s` | `NOW - 30s` |
+| Minutes | `m` | `NOW - 10m` |
+| Hours | `h` | `NOW - 2h` |
+| Days | `d` | `NOW - 7d` |
+| Weeks | `w` | `NOW - 1w` |
+| Natural months | `n` | (window intervals only) |
+| Natural years | `y` | (window intervals only) |
+
+**Epoch time:** Timestamps can be expressed as a long integer representing the number of time units (per database precision) since `1970-01-01 00:00:00 UTC`.
+
+## Data Types Reference
+
+| # | Type | Bytes | Description |
+|---|------|-------|-------------|
+| 1 | `TIMESTAMP` | 8 | Timestamp. Default millisecond precision; supports microsecond and nanosecond. |
+| 2 | `INT` | 4 | Signed integer, range `[-2^31, 2^31-1]` |
+| 3 | `INT UNSIGNED` | 4 | Unsigned integer, range `[0, 2^32-1]` |
+| 4 | `BIGINT` | 8 | Signed long integer, range `[-2^63, 2^63-1]` |
+| 5 | `BIGINT UNSIGNED` | 8 | Unsigned long integer, range `[0, 2^64-1]` |
+| 6 | `FLOAT` | 4 | Single-precision float, 6–7 significant digits, range `[-3.4E38, 3.4E38]` |
+| 7 | `DOUBLE` | 8 | Double-precision float, 15–16 significant digits, range `[-1.7E308, 1.7E308]` |
+| 8 | `SMALLINT` | 2 | Short integer, range `[-32768, 32767]` |
+| 9 | `SMALLINT UNSIGNED` | 2 | Unsigned short integer, range `[0, 65535]` |
+| 10 | `TINYINT` | 1 | Single-byte integer, range `[-128, 127]` |
+| 11 | `TINYINT UNSIGNED` | 1 | Unsigned single-byte integer, range `[0, 255]` |
+| 12 | `BOOL` | 1 | Boolean, `{true, false}` |
+| 13 | `VARCHAR` / `BINARY` | Variable | Single-byte string. Must specify max length, e.g., `VARCHAR(64)`. Alias for `BINARY`. |
+| 14 | `NCHAR` | Variable | Multi-byte string (Unicode). Each character occupies 4 bytes. Must specify max character count, e.g., `NCHAR(32)`. |
+| 15 | `JSON` | — | JSON type. Only supported as a **tag column**. |
+| 16 | `GEOMETRY` | Variable | 2D geometry type (POINT, LINESTRING, POLYGON). Supported from v3.1.0.0. |
+| 17 | `VARBINARY` | Variable | Variable-length binary data. Displayed as hex with `\x` prefix. Supported from v3.1.1.0. |
+| 18 | `DECIMAL(p, s)` | 8 or 16 | High-precision numeric. `p` = precision `[1,38]`, `s` = scale `[0,p]`. Supported from v3.3.6. |
+| 19 | `BLOB` | Up to 4 MB | Variable-length binary data. Max 4,194,304 bytes per column. Supported from v3.3.7.0. |
+
+## Numeric Types
+
+### Integer Types
+
+```sql
+col_tinyint   TINYINT           -- [-128, 127]
+col_tinyint_u TINYINT UNSIGNED  -- [0, 255]
+col_smallint  SMALLINT          -- [-32768, 32767]
+col_smallint_u SMALLINT UNSIGNED -- [0, 65535]
+col_int       INT               -- [-2147483648, 2147483647]
+col_int_u     INT UNSIGNED      -- [0, 4294967295]
+col_bigint    BIGINT            -- [-9223372036854775808, 9223372036854775807]
+col_bigint_u  BIGINT UNSIGNED   -- [0, 18446744073709551615]
+```
+
+### Floating-Point Types
+
+```sql
+col_float  FLOAT   -- 4 bytes, ~6-7 significant digits
+col_double DOUBLE  -- 8 bytes, ~15-16 significant digits
+```
+
+<Warning>
+Integer literals without a decimal point are always typed as `BIGINT`. Overflow is not an error — values are truncated. Float literals always default to `DOUBLE`.
+</Warning>
+
+### DECIMAL Type
+
+High-precision numeric type for financial and scientific calculations.
+
+```sql
+col_decimal DECIMAL(18, 4)  -- up to 18 digits, 4 decimal places
+col_dec38   DECIMAL(38, 10) -- 16-byte storage for precision > 18
+```
+
+**Rules:**
+- `DECIMAL(p, s)` where `p ∈ [1,38]`, `s ∈ [0, p]`
+- Precision `≤ 18` uses 8 bytes (DECIMAL64); precision `> 18` uses 16 bytes
+- Omitting scale defaults to 0: `DECIMAL(18)` = `DECIMAL(18, 0)`
+- Values exceeding `scale` are rounded; overflow returns `DECIMAL_OVERFLOW` error
+- **Not supported** as tag columns or with schemaless writes
+
+## String Types
+
+### VARCHAR / BINARY
+
+Single-byte string. Recommended for ASCII visible characters only.
+
+```sql
+col_name VARCHAR(64)   -- up to 64 bytes
+col_name BINARY(64)    -- equivalent to VARCHAR(64)
+```
+
+- Maximum length: 16,374 bytes for data columns; 16,382 bytes for tag columns (from v3.0.5.0: 65,517 bytes for data columns)
+- Must be enclosed in single quotes: `'hello world'`
+
+<Warning>
+Do not use `BINARY`/`VARCHAR` for multi-byte characters (e.g., Chinese). Use `NCHAR` instead. Forcing multi-byte data into `BINARY` can cause data corruption.
+</Warning>
+
+### NCHAR
+
+Unicode string for multi-byte characters including CJK.
+
+```sql
+col_name NCHAR(32)  -- up to 32 Unicode characters (128 bytes storage)
+```
+
+- Each NCHAR character occupies **4 bytes** of storage
+- Max length: 4,093 characters for data columns
+- Must be enclosed in single quotes; escape single quotes with `\'`
+
+### JSON
+
+Structured tag data in JSON format.
+
+```sql
+-- Only valid as a tag column in a supertable
+CREATE STABLE sensors (ts TIMESTAMP, val FLOAT) TAGS (info JSON);
+```
+
+<Note>
+`JSON` is only supported as a **tag column**. It cannot be used for regular data columns.
+</Note>
+
+## Binary Types
+
+### VARBINARY
+
+Variable-length binary data. Supported from v3.1.1.0.
+
+```sql
+col_data VARBINARY(256)  -- up to 256 bytes
+```
+
+- Data columns: max 65,517 bytes
+- Tag columns: max 16,382 bytes
+- Written as hex string starting with `\x`: `'\x48656C6C6F'`
+- Displayed as hex string with `\x` prefix
+
+### BLOB
+
+Large variable-length binary data. Supported from v3.3.7.0.
+
+```sql
+col_image BLOB  -- up to 4,194,304 bytes (4 MB)
+```
+
+<Warning>
+**BLOB limitations:**
+- Only **one** BLOB column is allowed per table
+- Cannot be used as a tag column
+- Not supported in virtual tables, stream computing, or conditional filtering
+</Warning>
+
+### GEOMETRY
+
+2D geometric types. Supported from v3.1.0.0.
+
+```sql
+col_location GEOMETRY(64)
+```
+
+Supported subtypes and size calculations:
+
+| Subtype | Min Bytes | Max Bytes | Size Growth |
+|---------|-----------|-----------|-------------|
+| `POINT(x y)` | 21 | 21 | Fixed |
+| `LINESTRING(x1 y1, x2 y2, ...)` | 41 | 65,473 | +16 per coordinate |
+| `POLYGON((x1 y1, x2 y2, ...))` | 61 | 65,477 | +16 per coordinate |
+
+- Data columns: max 65,517 bytes
+- Tag columns: max 16,382 bytes
+
+## BOOL Type
+
+```sql
+col_active BOOL  -- {true, false}
+```
+
+- Stored as 1 byte
+- Literal values: `TRUE`, `FALSE` (case-insensitive)
+
+## NULL Values
+
+Any type can hold a NULL value. NULL literals include:
+
+```sql
+''        -- empty string
+""        -- empty double-quoted string
+'\t'      -- tab
+' '       -- space
+NULL      -- explicit NULL keyword
+```
+
+<Note>
+`COUNT(*)` counts all rows including NULLs. `COUNT(col)` counts only non-NULL values in that column.
+</Note>
+
+## Constant Literals
+
+| # | Syntax | Type | Notes |
+|---|--------|------|-------|
+| 1 | `123`, `-123` | `BIGINT` | Integer literals are always `BIGINT` |
+| 2 | `123.45` | `DOUBLE` | Float literals are always `DOUBLE` |
+| 3 | `1.2E3` | `DOUBLE` | Scientific notation is always `DOUBLE` |
+| 4 | `'abc'` | `BINARY` | Single-quoted string |
+| 5 | `"abc"` | `BINARY` | Double-quoted string |
+| 6 | `TIMESTAMP 'literal'` | `TIMESTAMP` | Must match `YYYY-MM-DD HH:mm:ss.MS` |
+| 7 | `TRUE`, `FALSE` | `BOOL` | Boolean literals |
+| 8 | `NULL`, `''`, `" "` | any | Null value literal |
+
+## Row Size Limits
+
+| Version | Max Row Size |
+|---------|-------------|
+| Before v3.0.5.0 | 48 KB |
+| v3.0.5.0 and later | 64 KB |
+
+<Note>
+Each `VARCHAR`, `NCHAR`, `GEOMETRY`, and `VARBINARY` column adds 2 bytes of overhead beyond the declared length.
+</Note>

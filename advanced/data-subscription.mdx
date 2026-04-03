@@ -1,0 +1,256 @@
+---
+title: "Data Subscription"
+description: "Subscribe to real-time data streams in TDengine using the Kafka-compatible TMQ API — topics, consumer groups, offset management, and replay."
+---
+
+TDengine provides a data subscription and consumption interface modeled after message queue systems. Applications that need real-time access to data written into TDengine, or that must process data in event-arrival order, can use this interface without deploying a separate message broker like Kafka.
+
+The TDengine Message Queue (TMQ) API is **Kafka-compatible**, so developers familiar with Kafka can get started quickly and reuse existing patterns.
+
+## How It Works
+
+TDengine automatically creates indexes for Write-Ahead Logging (WAL) files to support fast random access and provides configurable file rotation and retention policies. Through these mechanisms, the WAL becomes a persistent storage engine that preserves event arrival order.
+
+During consumption, TDengine retrieves data according to the current offset, applies filtering and transformation using its unified query engine, and pushes the processed data to consumers.
+
+Key properties of the subscription system:
+
+- **At-least-once delivery**: An ACK mechanism ensures messages are delivered even across crashes and restarts.
+- **Consumer groups**: Multiple consumers sharing a group ID split consumption across partitions for higher throughput. Different groups maintain independent offsets.
+- **Single-consumer multi-topic**: A single consumer can subscribe to multiple topics simultaneously.
+- **Flexible granularity**: Topic data is determined by the SQL query used to define it. Filtering and preprocessing happen server-side, reducing data transmission volume.
+
+<Warning>
+Since version 3.2.0.0, data subscription supports vnode migration and splitting. Because WAL files are not synchronized during these operations, you should fully consume all WAL data before performing a vnode migration or split. Any unconsumed WAL data will be unavailable after the operation.
+</Warning>
+
+## Creating Topics
+
+A topic is the subscription unit in TDengine. You define what data a topic exposes by writing a SQL statement. TDengine supports three topic types.
+
+### Query Topic
+
+A query topic subscribes to the result of a SELECT statement. Only the data matching the query at the time of consumption is returned.
+
+```sql
+CREATE TOPIC [IF NOT EXISTS] topic_name AS subquery;
+```
+
+Restrictions:
+- Aggregate functions and time-window aggregations are not supported.
+- Subscribed or referenced columns cannot be deleted or modified after topic creation (from 3.4.0.0 you can, but you must reload the topic afterward).
+- Newly added columns after topic creation do not appear in results.
+
+**Example** — Subscribe to all smart meter records where voltage exceeds 200, returning only timestamp, current, and voltage:
+
+```sql
+CREATE TOPIC power_topic
+  AS SELECT ts, current, voltage
+  FROM power.meters
+  WHERE voltage > 200;
+```
+
+**Example** — Subscribe to all columns from a specific table:
+
+```sql
+CREATE TOPIC IF NOT EXISTS topic_meters
+  AS SELECT ts, current, voltage, phase, groupid, location
+  FROM meters;
+```
+
+### Supertable Topic
+
+A supertable topic subscribes to all data written into a supertable, including any future schema changes.
+
+```sql
+CREATE TOPIC [IF NOT EXISTS] topic_name [WITH META] AS STABLE stb_name [WHERE condition];
+```
+
+Key differences from a query topic:
+- Schema changes are not restricted — structural changes and new data continue to be included.
+- The returned data is **unstructured** and its schema adapts dynamically.
+- `WITH META` returns DDL statements for creating the supertable and its subtables (used by taosX for migration).
+- The optional `WHERE` clause filters which subtables are included — only tags or `tbname` are allowed, not regular data columns.
+- Tag values are not included in the returned data.
+
+```sql
+-- Subscribe to all subtables of meters where location tag is 'California'
+CREATE TOPIC meters_california WITH META AS STABLE meters WHERE location = 'California';
+```
+
+### Database Topic
+
+A database topic subscribes to all data in an entire database.
+
+```sql
+CREATE TOPIC [IF NOT EXISTS] topic_name [WITH META] AS DATABASE db_name;
+```
+
+- `WITH META` includes DDL statements for creating, deleting, and modifying all tables in the database — primarily used by taosX for full database migration.
+
+<Warning>
+Supertable and database-level subscriptions are advanced modes and are more prone to errors. Consult technical support before using them in production.
+</Warning>
+
+## Consumer Configuration
+
+Consumers can only be created using TDengine client drivers or connector APIs. When creating a consumer, you configure it with the following key parameters:
+
+| Parameter | Description |
+|-----------|-------------|
+| `td.connect.ip` | FQDN of the TDengine server |
+| `td.connect.user` | Username |
+| `td.connect.pass` | Password |
+| `td.connect.port` | Server port |
+| `group.id` | Consumer group ID; members of the same group share consumption progress |
+| `client.id` | Client identifier |
+| `auto.offset.reset` | Initial position for a new group's subscription |
+| `enable.auto.commit` | Whether to automatically commit offsets |
+| `auto.commit.interval.ms` | Interval for automatic offset commits |
+| `msg.with.table.name` | Whether to parse the table name from messages |
+| `enable.replay` | Whether to enable data replay mode |
+| `session.timeout.ms` | Timeout after missed consumer heartbeats |
+| `max.poll.interval.ms` | Maximum interval between consumer polls |
+| `fetch.max.wait.ms` | Maximum server wait time for a single fetch response |
+| `min.poll.rows` | Minimum number of rows returned per server fetch |
+
+## Consumer Groups
+
+When creating a consumer, you must assign it to a consumer group via `group.id`. Consumers in the same group share consumption progress — each message is delivered to only one consumer in the group, enabling parallel consumption.
+
+Different consumer groups consuming the same topic maintain **independent offsets**, so each group sees all messages.
+
+## Consuming Data: The Poll Loop
+
+The typical consumption workflow is:
+
+<Steps>
+  <Step title="Subscribe to topics">
+    Call the subscribe function and specify the list of topic names. A single consumer can subscribe to multiple topics.
+  </Step>
+  <Step title="Poll for messages">
+    Call the poll function in a loop. Each call retrieves one message, which may contain multiple records.
+  </Step>
+  <Step title="Process results">
+    Parse the returned result object. Field names and data types correspond one-to-one with the column names and types defined in the topic's query.
+  </Step>
+  <Step title="Commit offsets">
+    After successfully processing messages, commit the offset to record progress. Commits can be automatic (at a configured interval) or manual.
+  </Step>
+  <Step title="Unsubscribe and close">
+    When the consumer is no longer needed, unsubscribe from topics and close the consumer to release resources.
+  </Step>
+</Steps>
+
+### Offset Management
+
+You can specify a starting offset to re-read previously processed messages or skip messages that have already been handled.
+
+- **Automatic commit**: Configure `enable.auto.commit=true` and set `auto.commit.interval.ms`.
+- **Manual commit**: Call the commit function explicitly after processing each batch.
+
+A committed offset indicates that all messages up to that position have been successfully processed.
+
+## Managing Topics
+
+### View All Topics
+
+```sql
+SHOW TOPICS;
+```
+
+### View All Consumers
+
+```sql
+SHOW CONSUMERS;
+```
+
+### View Subscription Progress
+
+```sql
+SHOW SUBSCRIPTIONS;
+```
+
+This displays consumption progress of a topic across different vgroups, which you can use to monitor consumer lag.
+
+### Reload a Topic
+
+Use this when you have modified the schema of a subscribed table (added or removed columns) and need the topic to reflect the change:
+
+```sql
+RELOAD TOPIC IF EXISTS topic_name AS subquery;
+```
+
+<Note>
+`RELOAD TOPIC` is supported from version 3.3.9. When changing the schema of a subscribed table, stop all consumers first, apply the schema change, execute `RELOAD TOPIC`, then restart consumers.
+</Note>
+
+### Drop a Topic
+
+```sql
+DROP TOPIC [IF EXISTS] topic_name;
+```
+
+To forcibly drop a topic that is actively being consumed:
+
+```sql
+DROP TOPIC [IF EXISTS] FORCE topic_name;
+```
+
+After a forced deletion, any consumers still subscribed to the topic will encounter errors.
+
+### Delete a Consumer Group
+
+Individual consumers cannot be explicitly deleted. You delete the entire consumer group:
+
+```sql
+DROP CONSUMER GROUP [IF EXISTS] cgroup_name ON topic_name;
+```
+
+To forcibly delete a group with active consumers:
+
+```sql
+DROP CONSUMER GROUP [IF EXISTS] FORCE cgroup_name ON topic_name;
+```
+
+## Replay
+
+TDengine data subscription supports **replay** — replaying data streams in the order they were originally written, with the same timing between events.
+
+To enable replay, set `enable.replay=true` in your consumer configuration and specify a time range in your query.
+
+For example, if three records were written at these times:
+
+```
+2023/09/22 00:00:00.000
+2023/09/22 00:00:05.000
+2023/09/22 00:00:08.000
+```
+
+During replay:
+1. The first record is returned immediately.
+2. The second record is returned 5 seconds later.
+3. The third record is returned 3 seconds after the second.
+
+<Note>
+- Only **query topics** support replay. Supertable and database topics do not.
+- Replay progress is not saved. If replay is stopped, you cannot resume from the previous position.
+- A timing deviation of tens of milliseconds may occur during playback due to processing overhead.
+</Note>
+
+## Supported Languages
+
+TDengine provides subscription APIs for the following languages:
+
+<CardGroup cols={3}>
+  <Card title="C" />
+  <Card title="Java" />
+  <Card title="Go" />
+  <Card title="Rust" />
+  <Card title="Python" />
+  <Card title="C#" />
+</CardGroup>
+
+All language APIs maintain a high degree of compatibility with Kafka's subscription API. See the Connectors section of the TDengine documentation for language-specific usage guides and example code.
+
+TDengine also supports **MQTT subscriptions**, allowing data to be subscribed directly through MQTT clients.

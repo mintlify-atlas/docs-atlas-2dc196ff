@@ -1,0 +1,308 @@
+---
+title: "taosKeeper"
+description: "Reference for taosKeeper, the TDengine monitoring metrics export agent. Covers startup, configuration, collected metrics, Prometheus scraping, and the TDinsight Grafana dashboard."
+---
+
+taosKeeper is the monitoring metrics export tool for TDengine 3.x. It collects runtime statistics from TDengine, stores them in the `log` database, and exposes them in Prometheus format so you can monitor TDengine with tools like Grafana.
+
+taosKeeper connects to TDengine through the REST interface (taosAdapter), so no TDengine client library is required.
+
+## Prerequisites
+
+Before starting taosKeeper, ensure that:
+
+1. The TDengine cluster is running.
+2. taosAdapter is running.
+3. `taos.cfg` has monitoring enabled:
+
+```text
+monitor 1
+monitorFqdn localhost
+```
+
+## Installation
+
+taosKeeper is included in the TDengine installation package. To install separately or build from source, see the [taosKeeper repository](https://github.com/taosdata/taoskeeper).
+
+## Starting taosKeeper
+
+<Tabs>
+  <Tab title="Linux (systemd)">
+    ```bash
+    # Start
+    systemctl start taoskeeper
+
+    # Stop
+    systemctl stop taoskeeper
+
+    # Restart
+    systemctl restart taoskeeper
+
+    # Check status
+    systemctl status taoskeeper
+    ```
+
+    A running service reports:
+
+    ```text
+    Active: active (running)
+    ```
+
+    <Note>
+    If systemd is not available, start the process directly: `/usr/local/taos/bin/taoskeeper`
+    </Note>
+  </Tab>
+  <Tab title="macOS">
+    ```bash
+    # Start
+    sudo launchctl start com.tdengine.taoskeeper
+
+    # Stop
+    sudo launchctl stop com.tdengine.taoskeeper
+
+    # Check status
+    sudo launchctl list | grep taoskeeper
+    ```
+
+    A PID in the first column of the status output means the service is running. A `-` means it is stopped.
+  </Tab>
+</Tabs>
+
+## Health check
+
+```bash
+curl -i http://127.0.0.1:6043/check_health
+```
+
+A healthy instance responds:
+
+```json
+{"version":"3.3.2.3"}
+```
+
+with HTTP 200.
+
+## Configuration
+
+taosKeeper supports three configuration methods: command-line parameters, environment variables, and a TOML configuration file. Priority order: command line > environment variables > configuration file.
+
+The default configuration file is `/etc/taos/taoskeeper.toml`. Specify an alternate path with:
+
+```bash
+taoskeeper -c /path/to/taoskeeper.toml
+```
+
+### Full configuration example
+
+```toml
+# Instance ID to distinguish logs when multiple instances run simultaneously
+instanceId = 64
+
+# Listening host (IPv4/IPv6), default empty = all interfaces
+host = ""
+# Listening port
+port = 6043
+
+# Go goroutine pool size
+gopoolsize = 50000
+
+# Interval for refreshing metrics
+RotationInterval = "15s"
+
+[tdengine]
+host = "127.0.0.1"
+port = 6041
+username = "root"
+password = "taosdata"
+usessl = false
+
+[metrics]
+# Prefix added to all metric names
+prefix = "taos"
+
+# Extra non-supertable tables to export
+tables = []
+
+[metrics.database]
+name = "log"
+
+[metrics.database.options]
+vgroups = 1
+buffer = 64
+keep = 90
+cachemodel = "both"
+
+[prometheus]
+# Extra tables to include in v2 memory cache
+includeTables = []
+# Cached metric TTL in seconds (min 60, default 300)
+cacheTTL = 300
+
+[environment]
+incgroup = false
+
+[log]
+level = "info"
+rotationCount = 3
+keepDays = 3
+rotationSize = "1GB"
+compress = false
+reservedDiskSize = "1GB"
+```
+
+### Key configuration parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `port` | `6043` | HTTP listening port |
+| `RotationInterval` | `15s` | How often taosKeeper refreshes and reports metrics |
+| `tdengine.host` | `127.0.0.1` | TDengine server IP (taosAdapter endpoint) |
+| `tdengine.port` | `6041` | taosAdapter port |
+| `metrics.database.name` | `log` | Database where metrics are stored |
+| `metrics.database.options.keep` | `90` | Retention days for the metrics database |
+| `prometheus.cacheTTL` | `300` s | Expiry time for metrics in the v2 memory cache |
+| `log.path` | `/var/log/taos` | Log directory |
+| `log.level` | `info` | Log level: `trace`, `debug`, `info`, `warning`, `error` |
+
+## Metrics collected
+
+taosKeeper stores metrics in supertables in the `log` database. Query them from the taos CLI:
+
+```sql
+USE log;
+SHOW STABLES;
+```
+
+Example supertables:
+
+| Supertable | Contents |
+|-----------|----------|
+| `taosd_cluster_info` | Cluster-wide counters (databases, tables, connections) |
+| `taosd_dnodes_info` | Per-dnode CPU, memory, disk, I/O, network metrics |
+| `taosd_dnodes_status` | dnode online/offline status |
+| `taosd_vgroups_info` | Vgroup table counts and status |
+| `taosd_vnodes_info` | Vnode roles |
+| `taosd_mnodes_info` | Mnode roles |
+| `taosd_dnodes_data_dirs` | Data directory space |
+| `taosd_dnodes_log_dirs` | Log directory space |
+| `adapter_requests` | taosAdapter request counts and rates |
+| `taos_sql_req` | Client-side SQL request counts by type and result |
+| `taosd_sql_req` | Server-side SQL request counts |
+| `taos_slow_sql` | Slow query counts by duration bucket |
+| `keeper_monitor` | taosKeeper's own CPU and memory usage |
+
+View the most recent record for any supertable:
+
+```sql
+SELECT LAST_ROW(*) FROM taosd_dnodes_info;
+```
+
+### Key metrics reference
+
+#### Cluster metrics (`taosd_cluster_info`)
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `taosd_cluster_info_cluster_uptime` | gauge | Cluster uptime (seconds) |
+| `taosd_cluster_info_dbs_total` | gauge | Number of databases |
+| `taosd_cluster_info_tbs_total` | gauge | Number of tables |
+| `taosd_cluster_info_dnodes_total` | gauge | Total dnodes |
+| `taosd_cluster_info_dnodes_alive` | gauge | Active dnodes |
+| `taosd_cluster_info_connections_total` | gauge | Active connections |
+| `taosd_cluster_info_grants_timeseries_used` | gauge | Time series currently in use |
+| `taosd_cluster_info_grants_timeseries_total` | gauge | Total licensed time series |
+
+#### dnode metrics (`taosd_dnodes_info`)
+
+Tags: `cluster_id`, `dnode_ep`, `dnode_id`
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `taosd_dnodes_info_uptime` | gauge | Dnode uptime (seconds) |
+| `taosd_dnodes_info_cpu_engine` | gauge | TDengine process CPU usage (% × 100) |
+| `taosd_dnodes_info_cpu_system` | gauge | System CPU usage (% × 100) |
+| `taosd_dnodes_info_cpu_cores` | gauge | Number of CPU cores |
+| `taosd_dnodes_info_mem_engine` | gauge | TDengine process memory (KB) |
+| `taosd_dnodes_info_mem_free` | gauge | Free system memory (KB) |
+| `taosd_dnodes_info_mem_total` | gauge | Total system memory (KB) |
+| `taosd_dnodes_info_disk_used` | gauge | Used disk space (bytes) |
+| `taosd_dnodes_info_disk_total` | gauge | Total disk capacity (bytes) |
+| `taosd_dnodes_info_system_net_in` | gauge | Network receive rate (bytes/s) |
+| `taosd_dnodes_info_system_net_out` | gauge | Network transmit rate (bytes/s) |
+| `taosd_dnodes_info_io_read_disk` | gauge | Disk read rate (bytes/s) |
+| `taosd_dnodes_info_io_write_disk` | gauge | Disk write rate (bytes/s) |
+| `taosd_dnodes_info_vnodes_num` | gauge | Number of vnodes on this dnode |
+| `taosd_dnodes_info_masters` | gauge | Number of leader vnodes |
+
+## Prometheus integration
+
+taosKeeper exposes two Prometheus-format endpoints:
+
+| Endpoint | Mode | Recommendation |
+|----------|------|----------------|
+| `/metrics/v2` | Memory cache | Recommended — higher performance |
+| `/metrics` | Real-time query | Deprecated |
+
+### Scraping `/metrics/v2`
+
+The v2 endpoint uses a memory cache. In a multi-instance deployment, each taosKeeper instance holds only partial metric data, so **you must configure all taosKeeper endpoints** in Prometheus:
+
+```yaml
+scrape_configs:
+  - job_name: "taoskeeper-v2"
+    metrics_path: '/metrics/v2'
+    params:
+      max_age: ['30']
+    static_configs:
+      - targets:
+          - "taoskeeper-1:6043"
+          - "taoskeeper-2:6043"
+          - "taoskeeper-3:6043"
+```
+
+The `max_age` parameter (in seconds) filters out cached data older than the specified window.
+
+Example output from `/metrics/v2`:
+
+```text
+# HELP taosd_cluster_info_dbs_total Metric from taosd_cluster_info
+# TYPE taosd_cluster_info_dbs_total gauge
+taosd_cluster_info_dbs_total{cluster_id="2564125112573221874"} 13
+# HELP taosd_cluster_info_dnodes_alive Metric from taosd_cluster_info
+# TYPE taosd_cluster_info_dnodes_alive gauge
+taosd_cluster_info_dnodes_alive{cluster_id="2564125112573221874"} 1
+```
+
+### Scraping `/metrics` (single instance)
+
+```yaml
+scrape_configs:
+  - job_name: "taoskeeper"
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ["taoskeeper-1:6043"]
+```
+
+## TDinsight dashboard
+
+TDinsight is the official Grafana dashboard for monitoring TDengine clusters via taosKeeper.
+
+<Steps>
+  <Step title="Ensure prerequisites">
+    taosKeeper must be running and reporting data to the `log` database. The TDengine Grafana datasource plugin must be installed.
+  </Step>
+  <Step title="Import the dashboard">
+    In Grafana, go to **Dashboards → Import**. On the data source configuration page you can also click **Import TDinsight** directly.
+
+    For TDengine 3.x, use dashboard ID **18587** (`TaosKeeper Prometheus Dashboard for 3.x`).
+
+    Enter the ID and click **Load**, then select your TDengine datasource and click **Import**.
+  </Step>
+  <Step title="Verify data">
+    The dashboard shows cluster uptime, database and table counts, per-dnode CPU, memory, disk, and I/O metrics, slow query counts, and taosAdapter request rates.
+  </Step>
+</Steps>
+
+<Tip>
+Other community dashboards for TDengine are available on Grafana.com. Search for datasource `tdengine-datasource` at [grafana.com/grafana/dashboards](https://grafana.com/grafana/dashboards/?dataSource=tdengine-datasource).
+</Tip>

@@ -1,28 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "TDengine",
+  "projectType": "data-platform",
+  "projectName": "TDengine",
+  "projectDescription": "A high-performance, cloud-native, AI-powered time-series database built for Industrial IoT, capable of ingesting and processing petabytes of data per day from billions of sensors.",
   "theme": "aspen",
-  "colors": {
-    "primary": "#1047c0",
-    "light": "#d2ddeb",
-    "dark": "#f90909"
-  },
-  "favicon": "https://media.brand.dev/01c69a99-e32f-4afd-a102-350e05b5b641.jpg",
-  "logo": {
-    "light": "https://media.brand.dev/074bda83-fccf-437f-990e-babaf4046950.png",
-    "dark": "https://media.brand.dev/074bda83-fccf-437f-990e-babaf4046950.png"
-  },
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/taosdata/TDengine"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/taosdata/TDengine"
-    }
-  },
+  "primaryColor": "#1047c0",
+  "lightColor": "#d2ddeb",
+  "darkColor": "#f90909",
   "navigation": {
     "tabs": [
       {
@@ -124,5 +107,32 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "One table per device data model with supertables for cross-device aggregation",
+    "High-performance ingestion and querying — up to 10.6x faster than competing TSDBs",
+    "Built-in stream processing engine for real-time event-driven analytics",
+    "Native data subscription with Kafka-compatible consumer API",
+    "TDgpt AI agent for time-series forecasting, anomaly detection, and imputation",
+    "Zero-code data connectors for MQTT, OPC, Kafka, InfluxDB, and more",
+    "Schemaless ingestion via InfluxDB Line Protocol, OpenTSDB Telnet/JSON",
+    "Cloud-native distributed architecture with Kubernetes support and RAFT consensus",
+    "Tiered storage with S3 support and 10:1 data compression",
+    "REST API, JDBC/ODBC, and multi-language client libraries (C/C++, Java, Python, Go, Rust, Node.js)"
+  ],
+  "publicApiSurface": [
+    "taos_connect() / taos_close() — C client library connection API",
+    "taos_query() / taos_fetch_row() — synchronous query execution",
+    "taos_stmt_prepare() / taos_stmt_execute() — parameterized statement API",
+    "taos_schemaless_insert() — schemaless InfluxDB/OpenTSDB line protocol ingestion",
+    "taos_subscribe() / taos_consume() — data subscription consumer API",
+    "CREATE TABLE / CREATE STABLE — DDL for tables and supertables",
+    "INSERT INTO ... USING ... TAGS — auto-create child table on insert",
+    "SELECT ... FROM ... INTERVAL() FILL() SLIMIT() — time-series SQL extensions",
+    "CREATE STREAM ... AS SELECT ... — stream processing DDL",
+    "CREATE TOPIC / taos_tmq_new_consumer() — TMQ (TDengine Message Queue) API",
+    "REST API /rest/sql — HTTP endpoint for SQL execution",
+    "taosAdapter HTTP API — RESTful data ingestion and query interface",
+    "User-Defined Functions (UDF) in C and Python"
+  ]
 }

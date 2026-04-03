@@ -1,0 +1,336 @@
+---
+title: "Parameterized Statements (STMT)"
+description: "Use parameterized SQL statements (STMT/STMT2) in TDengine for high-throughput batch ingestion with reduced parsing overhead and SQL injection prevention."
+---
+
+Parameterized statements (STMT) let you prepare an SQL template once and then execute it repeatedly with different parameter values. This approach improves write performance in three ways:
+
+- **Reduced parsing time**: The SQL structure is compiled once. Subsequent executions only substitute parameter values, skipping the full parse on every call.
+- **Precompilation**: The prepared statement is cached and reused, eliminating repeated optimization steps.
+- **Reduced network overhead**: Only parameter values are sent on each execution, not the full SQL text. This is especially significant for large-volume insert workloads.
+
+<Tip>
+TDengine recommends using parameterized statements for all production data insertion. The STMT2 API (available from TDengine v3.3.5.0) is the preferred interface and supports batch binding across multiple subtables in a single call.
+</Tip>
+
+## Supported SQL forms
+
+Only the following two SQL patterns are supported for parameterized binding:
+
+```sql
+-- Form 1: subtable already exists; omit tags for best performance
+INSERT INTO meters (tbname, ts, current, voltage, phase) VALUES(?, ?, ?, ?, ?)
+
+-- Form 2: auto-create subtable if it does not exist
+INSERT INTO ? USING meters TAGS (?, ?) VALUES (?, ?, ?, ?)
+```
+
+<Note>
+If the subtable does not exist and you use Form 1 (no tag specification), STMT reports an error instead of silently creating a table with NULL tags. This prevents data loss from accidental table name typos.
+</Note>
+
+## STMT2 workflow
+
+<Steps>
+  <Step title="Initialize the statement">
+    Create a `STMT2` object linked to an open connection and configure options such as whether to enable reqId tracing.
+  </Step>
+  <Step title="Prepare the SQL template">
+    Call `prepare()` with the parameterized SQL. The SQL is compiled and cached at this point.
+  </Step>
+  <Step title="Bind tag and column values">
+    For each subtable in your batch, supply the table name, tag values, and column values. The STMT2 API supports binding data for multiple subtables in a single bind call.
+  </Step>
+  <Step title="Execute the batch">
+    Call `execute()` / `exec()` to send all bound data to TDengine in one network round trip.
+  </Step>
+  <Step title="Close the statement">
+    Release the statement resources after all data has been written.
+  </Step>
+</Steps>
+
+## Examples
+
+The following examples insert data into the `meters` supertable, creating 10 subtables with 10 rows each.
+
+### WebSocket connection
+
+<CodeGroup>
+
+```python stmt2_ws.py
+from datetime import datetime
+import random
+import taosws
+
+numOfSubTable = 10
+numOfRow      = 10
+
+conn   = None
+stmt2  = None
+host   = "localhost"
+port   = 6041
+
+try:
+    conn = taosws.connect(
+        user="root", password="taosdata", host=host, port=port
+    )
+
+    conn.execute("CREATE DATABASE IF NOT EXISTS power")
+    conn.execute("USE power")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS `meters` "
+        "(`ts` TIMESTAMP, `current` FLOAT, `voltage` INT, `phase` FLOAT) "
+        "TAGS (`groupid` INT, `location` BINARY(16))"
+    )
+
+    sql   = "INSERT INTO ? USING meters (groupid, location) TAGS(?,?) VALUES (?,?,?,?)"
+    stmt2 = conn.stmt2_statement()
+    stmt2.prepare(sql)
+
+    for i in range(numOfSubTable):
+        current_ms = int(datetime.now().timestamp() * 1000)
+        timestamps = [current_ms + j for j in range(numOfRow)]
+        currents   = [random.random() * 30       for _ in range(numOfRow)]
+        voltages   = [random.randint(100, 300)   for _ in range(numOfRow)]
+        phases     = [random.random()            for _ in range(numOfRow)]
+
+        param = taosws.stmt2_bind_param_view(
+            table_name=f"d_bind_{i}",
+            tags=[
+                taosws.int_to_tag(i),
+                taosws.varchar_to_tag(f"location_{i}"),
+            ],
+            columns=[
+                taosws.millis_timestamps_to_column(timestamps),
+                taosws.floats_to_column(currents),
+                taosws.ints_to_column(voltages),
+                taosws.floats_to_column(phases),
+            ],
+        )
+
+        stmt2.bind([param])
+        stmt2.execute()
+        print(f"Inserted subtable d_bind_{i} successfully.")
+
+except Exception as err:
+    print(f"Failed to insert using stmt2: {err}")
+    raise err
+finally:
+    if stmt2:
+        stmt2.close()
+    if conn:
+        conn.close()
+```
+
+```c stmt2_insert_demo.c
+// compile: gcc -o stmt2_insert_demo stmt2_insert_demo.c -ltaos
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/time.h>
+#include "taos.h"
+
+#define NUM_OF_SUB_TABLES 10
+#define NUM_OF_ROWS       10
+
+void executeSQL(TAOS *taos, const char *sql) {
+    TAOS_RES *res  = taos_query(taos, sql);
+    int       code = taos_errno(res);
+    if (code != 0) {
+        fprintf(stderr, "Error: %s\n", taos_errstr(res));
+        taos_free_result(res);
+        taos_close(taos);
+        exit(EXIT_FAILURE);
+    }
+    taos_free_result(res);
+}
+
+void checkErrorCode(TAOS_STMT2 *stmt2, int code, const char *msg) {
+    if (code != 0) {
+        fprintf(stderr, "%s. Code: %d, Error: %s\n", msg, code,
+                taos_stmt2_error(stmt2));
+        taos_stmt2_close(stmt2);
+        exit(EXIT_FAILURE);
+    }
+}
+
+int main() {
+    // Use WebSocket driver
+    taos_options(TSDB_OPTION_DRIVER, "websocket");
+
+    TAOS *taos = taos_connect("localhost", "root", "taosdata", NULL, 6041);
+    if (taos == NULL) {
+        fprintf(stderr, "Connection failed: %s\n", taos_errstr(NULL));
+        return EXIT_FAILURE;
+    }
+
+    executeSQL(taos, "CREATE DATABASE IF NOT EXISTS power");
+    executeSQL(taos, "USE power");
+    executeSQL(taos,
+        "CREATE STABLE IF NOT EXISTS power.meters "
+        "(ts TIMESTAMP, current FLOAT, voltage INT, phase FLOAT) "
+        "TAGS (groupId INT, location BINARY(24))");
+
+    // Initialize STMT2
+    TAOS_STMT2_OPTION option = {0, false, false, NULL, NULL};
+    TAOS_STMT2       *stmt2  = taos_stmt2_init(taos, &option);
+
+    // Prepare the parameterized SQL
+    checkErrorCode(stmt2,
+        taos_stmt2_prepare(stmt2,
+            "INSERT INTO ? USING meters TAGS(?,?) VALUES (?,?,?,?)", 0),
+        "Prepare failed");
+
+    // Allocate and populate binding data for all subtables
+    char            **table_name = malloc(NUM_OF_SUB_TABLES * sizeof(char *));
+    TAOS_STMT2_BIND **tags       = malloc(NUM_OF_SUB_TABLES * sizeof(TAOS_STMT2_BIND *));
+    TAOS_STMT2_BIND **params     = malloc(NUM_OF_SUB_TABLES * sizeof(TAOS_STMT2_BIND *));
+
+    for (int i = 0; i < NUM_OF_SUB_TABLES; i++) {
+        table_name[i] = malloc(20);
+        sprintf(table_name[i], "d_bind_%d", i);
+
+        int *gid     = malloc(sizeof(int)); *gid = i;
+        int *gid_len = malloc(sizeof(int)); *gid_len = sizeof(int);
+
+        char *location     = malloc(20);
+        int  *location_len = malloc(sizeof(int));
+        *location_len = sprintf(location, "location_%d", i);
+
+        tags[i]    = malloc(2 * sizeof(TAOS_STMT2_BIND));
+        tags[i][0] = (TAOS_STMT2_BIND){TSDB_DATA_TYPE_INT,    gid,      gid_len,      NULL, 1};
+        tags[i][1] = (TAOS_STMT2_BIND){TSDB_DATA_TYPE_BINARY, location, location_len, NULL, 1};
+
+        params[i] = malloc(4 * sizeof(TAOS_STMT2_BIND));
+        int64_t *ts       = malloc(NUM_OF_ROWS * sizeof(int64_t));
+        float   *current  = malloc(NUM_OF_ROWS * sizeof(float));
+        int     *voltage  = malloc(NUM_OF_ROWS * sizeof(int));
+        float   *phase    = malloc(NUM_OF_ROWS * sizeof(float));
+        int32_t *ts_len   = malloc(NUM_OF_ROWS * sizeof(int32_t));
+        int32_t *cur_len  = malloc(NUM_OF_ROWS * sizeof(int32_t));
+        int32_t *vol_len  = malloc(NUM_OF_ROWS * sizeof(int32_t));
+        int32_t *pha_len  = malloc(NUM_OF_ROWS * sizeof(int32_t));
+
+        for (int j = 0; j < NUM_OF_ROWS; j++) {
+            struct timeval tv; gettimeofday(&tv, NULL);
+            ts[j]      = tv.tv_sec * 1000LL + tv.tv_usec / 1000 + j;
+            current[j] = (float)rand() / RAND_MAX * 30;
+            voltage[j] = rand() % 300;
+            phase[j]   = (float)rand() / RAND_MAX;
+            ts_len[j]  = sizeof(int64_t);
+            cur_len[j] = sizeof(float);
+            vol_len[j] = sizeof(int);
+            pha_len[j] = sizeof(float);
+        }
+
+        params[i][0] = (TAOS_STMT2_BIND){TSDB_DATA_TYPE_TIMESTAMP, ts,      ts_len,  NULL, NUM_OF_ROWS};
+        params[i][1] = (TAOS_STMT2_BIND){TSDB_DATA_TYPE_FLOAT,     current, cur_len, NULL, NUM_OF_ROWS};
+        params[i][2] = (TAOS_STMT2_BIND){TSDB_DATA_TYPE_INT,       voltage, vol_len, NULL, NUM_OF_ROWS};
+        params[i][3] = (TAOS_STMT2_BIND){TSDB_DATA_TYPE_FLOAT,     phase,   pha_len, NULL, NUM_OF_ROWS};
+    }
+
+    // Bind all subtables at once
+    TAOS_STMT2_BINDV bindv = {NUM_OF_SUB_TABLES, table_name, tags, params};
+    checkErrorCode(stmt2, taos_stmt2_bind_param(stmt2, &bindv, -1), "Bind failed");
+
+    // Execute the batch
+    int affected = 0;
+    checkErrorCode(stmt2, taos_stmt2_exec(stmt2, &affected), "Exec failed");
+    printf("Successfully inserted %d rows.\n", affected);
+
+    taos_stmt2_close(stmt2);
+    taos_close(taos);
+    taos_cleanup();
+    return 0;
+}
+```
+
+</CodeGroup>
+
+### Native connection
+
+<CodeGroup>
+
+```python stmt2_native.py
+from datetime import datetime
+import random
+import taos
+
+numOfSubTable = 10
+numOfRow      = 10
+
+conn   = None
+stmt2  = None
+
+try:
+    conn = taos.connect(
+        host="localhost", port=6030,
+        user="root", password="taosdata"
+    )
+
+    conn.execute("CREATE DATABASE IF NOT EXISTS power")
+    conn.execute("USE power")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS `meters` "
+        "(`ts` TIMESTAMP, `current` FLOAT, `voltage` INT, `phase` FLOAT) "
+        "TAGS (`groupid` INT, `location` BINARY(16))"
+    )
+
+    sql   = "INSERT INTO ? USING meters (groupid, location) TAGS(?,?) VALUES (?,?,?,?)"
+    stmt2 = conn.stmt2_statement(sql)
+
+    for i in range(numOfSubTable):
+        current_ms = int(datetime.now().timestamp() * 1000)
+        timestamps = [current_ms + j for j in range(numOfRow)]
+        currents   = [random.random() * 30     for _ in range(numOfRow)]
+        voltages   = [random.randint(100, 300) for _ in range(numOfRow)]
+        phases     = [random.random()          for _ in range(numOfRow)]
+
+        stmt2.bind_param(
+            table_name=f"d_bind_{i}",
+            tags=[taos.SmlTagData(i, taos.SmlDataType.INT),
+                  taos.SmlTagData(f"location_{i}", taos.SmlDataType.BINARY)],
+            cols=[timestamps, currents, voltages, phases],
+        )
+        stmt2.execute()
+
+except Exception as err:
+    print(f"Failed to insert using stmt2: {err}")
+    raise err
+finally:
+    if stmt2:
+        stmt2.close()
+    if conn:
+        conn.close()
+```
+
+</CodeGroup>
+
+## Batch binding for high throughput
+
+The STMT2 API supports binding multiple subtables in a single `bind_param` call via the `TAOS_STMT2_BINDV` structure. This reduces round trips and is the recommended approach when writing to many subtables concurrently:
+
+```c
+// Bind NUM_OF_SUB_TABLES subtables in a single call
+TAOS_STMT2_BINDV bindv = {
+    .count       = NUM_OF_SUB_TABLES,
+    .tbnames     = table_name,   // char **
+    .tags        = tags,         // TAOS_STMT2_BIND **
+    .bind_cols   = params        // TAOS_STMT2_BIND **
+};
+taos_stmt2_bind_param(stmt2, &bindv, -1);
+taos_stmt2_exec(stmt2, &affected_rows);
+```
+
+## Performance comparison
+
+| Write method                          | Relative throughput |
+| ------------------------------------- | ------------------- |
+| Parameter binding (STMT2)             | Highest             |
+| Raw SQL without auto table creation   | High                |
+| Raw SQL with auto table creation      | Medium              |
+| Schemaless ingestion                  | Lower               |
+
+<Note>
+For large-scale ingestion pipelines, combine STMT2 with pre-created subtables (using `CREATE TABLE ... USING`) and write data in ascending timestamp order per subtable. Out-of-order writes trigger additional server-side sorting and reduce write throughput.
+</Note>

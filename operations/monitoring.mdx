@@ -1,0 +1,292 @@
+---
+title: "Monitoring"
+description: "Monitor TDengine cluster health using taosKeeper, Grafana TDinsight, Prometheus, and SHOW commands."
+---
+
+TDengine integrates a monitoring pipeline where `taosd` and `taosX` report runtime metrics to **taosKeeper**, which writes them into a designated TDengine database (default: `log`). You can then visualize those metrics with the **TDinsight** Grafana dashboard or scrape them with Prometheus.
+
+## taosKeeper
+
+taosKeeper is the metrics collection component for TDengine 3.x. It receives monitoring data over HTTP and writes it to TDengine using the RESTful interface—no native client library required.
+
+### Prerequisites
+
+- TDengine cluster is running.
+- taosAdapter is running.
+- In `taos.cfg`, at minimum configure:
+
+  ```shell
+  monitor 1
+  monitorFqdn localhost   # FQDN of the taosKeeper host
+  ```
+
+### Configuration
+
+The default configuration file is `/etc/taos/taoskeeper.toml`:
+
+```toml
+# Instance ID for this taoskeeper, default 64
+instanceId = 64
+
+# Listen address and port
+host = ""
+port = 6043
+
+# Metrics refresh interval
+RotationInterval = "15s"
+
+[tdengine]
+host = "127.0.0.1"
+port = 6041
+username = "root"
+password = "taosdata"
+usessl = false
+
+[metrics]
+prefix = "taos"
+tables = []
+
+[metrics.database]
+name = "log"
+
+[metrics.database.options]
+vgroups = 1
+buffer = 64
+keep = 90
+cachemodel = "both"
+
+[log]
+level = "info"
+rotationCount = 3
+keepDays = 3
+rotationSize = "1GB"
+compress = false
+reservedDiskSize = "1GB"
+```
+
+The `metrics.database.name` setting controls where monitoring data is stored. Change it if you want to separate monitoring data into a different database.
+
+### Starting taosKeeper
+
+```bash
+systemctl start taoskeeper
+systemctl status taoskeeper
+```
+
+Check that taosKeeper is healthy:
+
+```bash
+curl -i http://127.0.0.1:6043/check_health
+```
+
+A healthy instance returns HTTP 200 with its version:
+
+```text
+HTTP/1.1 200 OK
+{"version":"3.3.2.3"}
+```
+
+### Viewing collected metrics
+
+taosKeeper creates supertables in the `log` database for each category of metrics:
+
+```sql
+USE log;
+SHOW STABLES;
+```
+
+Example output:
+
+```text
+taosd_dnodes_status
+taosd_vnodes_info
+taosd_vgroups_info
+taosd_cluster_info
+taosd_dnodes_info
+taosd_dnodes_data_dirs
+taosd_dnodes_log_dirs
+adapter_requests
+keeper_monitor
+taos_sql_req
+taos_slow_sql
+```
+
+Query the most recent report for any supertable:
+
+```sql
+SELECT last_row(*) FROM taosd_dnodes_info;
+```
+
+## Monitoring with Grafana and TDinsight
+
+TDinsight is a pre-built Grafana dashboard that visualizes TDengine cluster status, dnode resource usage, query rates, and insert rates.
+
+### Prerequisites
+
+- Grafana 11.0.0 or later.
+- TDengine Grafana datasource plugin installed and a data source configured pointing to your taosAdapter (e.g., `http://your-host:6041`).
+- taosKeeper running and collecting data.
+
+### Importing the dashboard
+
+<Steps>
+  <Step title="Open Grafana">
+    Navigate to **Home → Dashboards** and click **New → Import**.
+  </Step>
+  <Step title="Import TDinsight">
+    Enter Dashboard ID `18180` and click **Load**, or use the URL:
+
+    ```text
+    https://grafana.com/grafana/dashboards/18180-tdinsight-for-3-x/
+    ```
+  </Step>
+  <Step title="Select the log database">
+    After the dashboard loads, use the **Log from** dropdown in the upper-left corner to select the `log` database (or whichever database you configured in taoskeeper).
+  </Step>
+</Steps>
+
+The TDinsight dashboard shows:
+
+- Cluster uptime, dnode count, and vgroup status
+- Per-dnode CPU, memory, disk, and network I/O
+- Insert and query request rates
+- Slow query counts
+
+## Key metrics to monitor
+
+### Cluster-level metrics (`taosd_cluster_info`)
+
+| Metric | Meaning |
+|--------|---------|
+| `taosd_cluster_info_dnodes_total` | Total dnodes in the cluster |
+| `taosd_cluster_info_dnodes_alive` | Dnodes in ready state |
+| `taosd_cluster_info_vgroups_alive` | Vgroups in ready state |
+| `taosd_cluster_info_connections_total` | Active connections |
+| `taosd_cluster_info_grants_expire_time` | License expiration remaining time (seconds) |
+
+### Per-dnode metrics (`taosd_dnodes_info`)
+
+| Metric | Meaning |
+|--------|---------|
+| `taosd_dnodes_info_cpu_engine` | CPU used by taosd process (%) |
+| `taosd_dnodes_info_cpu_system` | Total system CPU usage (%) |
+| `taosd_dnodes_info_mem_engine` | Memory used by taosd process (KB) |
+| `taosd_dnodes_info_mem_free` | Free system memory (KB) |
+| `taosd_dnodes_info_disk_used` | Used disk space (bytes) |
+| `taosd_dnodes_info_disk_total` | Total disk space (bytes) |
+| `taosd_dnodes_info_io_read` | Disk read rate (bytes/s) |
+| `taosd_dnodes_info_io_write` | Disk write rate (bytes/s) |
+| `taosd_dnodes_info_system_net_in` | Network inbound rate (bytes/s) |
+| `taosd_dnodes_info_system_net_out` | Network outbound rate (bytes/s) |
+| `taosd_dnodes_status_status` | Dnode status: 1 = ready, 0 = offline |
+
+### Write performance metrics (`taosd_write_metrics`)
+
+| Metric | Meaning |
+|--------|---------|
+| `taosd_write_metrics_total_rows` | Rows processed by vnode |
+| `taosd_write_metrics_commit_time` | Vnode commit request processing time (ms) |
+| `taosd_write_metrics_wal_write_time` | WAL write time (ms) |
+
+### Query performance metrics
+
+| Metric | Meaning |
+|--------|---------|
+| `taosd_perf_slow_queries_total` | Total slow queries |
+| `taosd_perf_very_slow_queries_total` | Queries with execution time > 300 ms |
+
+### taosAdapter metrics (`adapter_requests`)
+
+| Metric | Meaning |
+|--------|---------|
+| `taos_adapter_requests_total` | Total request count |
+| `taos_adapter_requests_success` | Successful requests |
+| `taos_adapter_requests_fail` | Failed requests |
+| `taos_adapter_requests_query` | Query requests |
+| `taos_adapter_requests_write` | Write requests |
+
+## Prometheus integration
+
+taosKeeper exposes a Prometheus-compatible endpoint at `/metrics/v2` (recommended) and the deprecated `/metrics`.
+
+### How `/metrics/v2` works
+
+The v2 endpoint uses an in-memory cache. Because each taosKeeper instance only receives partial metric data from the cluster, **you must configure all taosKeeper instance endpoints in Prometheus** to get complete data.
+
+```yaml
+scrape_configs:
+  - job_name: "taoskeeper-v2"
+    metrics_path: '/metrics/v2'
+    params:
+      max_age: ['30']
+    static_configs:
+      - targets:
+          - "taoskeeper-1:6043"
+          - "taoskeeper-2:6043"
+          - "taoskeeper-3:6043"
+```
+
+The optional `max_age` parameter (in seconds) filters out stale cached data. Default is 30 seconds.
+
+Import the **TaosKeeper Prometheus Dashboard for 3.x** (Grafana ID `18587`) to get a Grafana dashboard backed by Prometheus data.
+
+## SHOW commands for cluster status
+
+Use these SQL commands from `taos` CLI to inspect cluster health without Grafana:
+
+```sql
+-- View all dnodes
+SHOW DNODES;
+
+-- View mnode status and roles
+SHOW MNODES;
+
+-- View vgroup distribution
+SHOW VGROUPS;
+
+-- View current connections
+SHOW CONNECTIONS;
+
+-- View running queries
+SHOW QUERIES;
+
+-- View user privileges
+SHOW USER PRIVILEGES;
+```
+
+## Monitoring taosX
+
+taosX monitoring uses the same architecture as taosd monitoring. Configure the `[monitor]` section in `/etc/taos/taosx.toml`:
+
+```toml
+[monitor]
+# FQDN of the taosKeeper service
+fqdn = "localhost"
+# taosKeeper port (default 6043)
+port = 6043
+# Metrics reporting interval in seconds (1–10)
+interval = 10
+```
+
+Import the **TDinsight for taosX** dashboard from the TDengine datasource plugin's Dashboard tab in Grafana to monitor:
+
+- taosX process health
+- taosx-agent processes
+- Connector subprocesses
+- Active data ingestion tasks
+
+<Note>
+taosX monitoring only works when taosX is running in server mode. TDengine Enterprise 3.2.3.0+ includes this feature. If taosX is installed separately, version 1.5.0 or later is required.
+</Note>
+
+## Alert configuration
+
+Configure Grafana alerts on TDinsight panels for the following conditions:
+
+- `taosd_dnodes_status_status = 0` — a dnode went offline
+- `taosd_dnodes_info_cpu_engine > 80` — CPU usage above 80%
+- `taosd_dnodes_info_disk_used / taosd_dnodes_info_disk_total > 0.85` — disk above 85% full
+- `taosd_perf_very_slow_queries_total` increasing rapidly — query latency degradation
+- `taos_adapter_requests_fail` spiking — connection or write errors
+
+Set alert notification channels (email, Slack, PagerDuty, etc.) in Grafana's **Alerting → Contact points** configuration.

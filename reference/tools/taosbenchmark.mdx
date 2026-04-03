@@ -1,0 +1,267 @@
+---
+title: "taosBenchmark"
+description: "Reference for taosBenchmark, the performance testing and data generation tool for TDengine. Covers quick start, JSON configuration, insert and query benchmarks, and output metrics."
+---
+
+taosBenchmark is a performance benchmarking tool for TDengine. It generates insert, query, and subscription workloads and reports performance metrics. It also ships with the TDengine server and client packages.
+
+<Note>
+Ensure the TDengine cluster is running before starting taosBenchmark.
+</Note>
+
+## Quick start
+
+Run taosBenchmark with no arguments to immediately execute a write performance test using default settings:
+
+```bash
+taosBenchmark
+```
+
+This connects to the TDengine cluster defined in `/etc/taos/taos.cfg`, creates a `test` database with a `meters` supertable, generates 10,000 subtables with 10,000 rows each, and prints a performance summary.
+
+<Warning>
+If the `test` database already exists, it is dropped and recreated.
+</Warning>
+
+## Operating modes
+
+taosBenchmark supports three modes:
+
+<CardGroup cols={3}>
+  <Card title="No parameters" icon="play">
+    Default settings. Immediately runs an insert benchmark against the local cluster.
+  </Card>
+  <Card title="Command-line parameters" icon="terminal">
+    Customize the most common insert settings from the command line. Does not support query or subscription tests.
+  </Card>
+  <Card title="JSON configuration file" icon="file">
+    Full control over insert, query, and subscription tests. Use `-f <file>` to specify a config file.
+  </Card>
+</CardGroup>
+
+Command-line parameters take precedence over JSON configuration when both are used.
+
+## Command-line parameters
+
+```bash
+taosBenchmark -d mydb -t 100 -n 1000 -T 4 -I stmt -y
+```
+
+This creates database `mydb`, 100 subtables under the default `meters` supertable, inserts 1000 rows per subtable using the statement binding (`stmt`) interface, with 4 threads, and skips the confirmation prompt.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-f/--file <json>` | — | JSON configuration file path |
+| `-h/--host <host>` | `localhost` | TDengine server FQDN |
+| `-P/--port <port>` | `6030` | TDengine server port |
+| `-u/--user <user>` | `root` | Username |
+| `-p/--password <pass>` | `taosdata` | Password |
+| `-d/--database <name>` | `test` | Database name |
+| `-t/--tables <num>` | `10000` | Number of subtables |
+| `-n/--records <num>` | `10000` | Rows per subtable |
+| `-T/--thread <num>` | `8` | Number of insert threads |
+| `-I/--interface <mode>` | `taosc` | Insert mode: `taosc`, `stmt`, `stmt2`, `sml` |
+| `-r/--rec-per-req <num>` | `30000` | Rows per write request |
+| `-b/--data-type <types>` | `FLOAT,INT,FLOAT` | Supertable column types (comma-separated) |
+| `-l/--columns <num>` | — | Total number of columns |
+| `-A/--tag-type <types>` | `INT,BINARY(16)` | Tag column types |
+| `-S/--timestampstep <ms>` | `1` | Timestamp step between rows (ms) |
+| `-B/--interlace-rows <num>` | `0` | Rows per subtable per round in interlaced mode |
+| `-O/--disorder <pct>` | `0` | Percentage of out-of-order rows (0–50) |
+| `-a/--replica <num>` | `1` | Number of database replicas |
+| `-v/--vgroups <num>` | — | Number of vgroups (TDengine 3.0+) |
+| `-M/--random` | off | Generate random data values |
+| `-y/--answer-yes` | off | Skip confirmation prompts |
+| `-Q/--nodrop` | off | Do not drop existing database |
+| `-Z/--driver <driver>` | `Native` | `Native` or `WebSocket` |
+| `-o/--output <file>` | `./output.txt` | Results output file |
+| `-V/--version` | — | Print version and exit |
+
+## JSON configuration file
+
+The JSON configuration file mode provides the full feature set. Set `filetype` to `insert`, `query`, `subscribe`, or `csvfile`:
+
+```bash
+taosBenchmark -f insert.json
+```
+
+### Insert configuration
+
+```json
+{
+  "filetype": "insert",
+  "host": "127.0.0.1",
+  "port": 6030,
+  "user": "root",
+  "password": "taosdata",
+  "thread_count": 8,
+  "num_of_records_per_req": 30000,
+  "dbinfo": {
+    "name": "test",
+    "drop": "yes",
+    "vgroups": 4,
+    "replica": 1
+  },
+  "super_tables": [
+    {
+      "name": "meters",
+      "child_table_exists": "no",
+      "childtable_count": 10000,
+      "childtable_prefix": "d",
+      "insert_mode": "taosc",
+      "insert_rows": 10000,
+      "columns": [
+        {"type": "float", "name": "current", "min": 1, "max": 100},
+        {"type": "int", "name": "voltage", "min": 200, "max": 240},
+        {"type": "float", "name": "phase", "min": 0, "max": 1}
+      ],
+      "tags": [
+        {"type": "binary", "name": "location", "len": 64},
+        {"type": "int", "name": "groupid", "max": 10, "min": 1}
+      ]
+    }
+  ]
+}
+```
+
+### Query configuration
+
+```json
+{
+  "filetype": "query",
+  "host": "127.0.0.1",
+  "user": "root",
+  "password": "taosdata",
+  "query_times": 100,
+  "specified_table_query": {
+    "threads": 4,
+    "sqls": [
+      {
+        "sql": "SELECT AVG(current) FROM test.meters WHERE ts > NOW - 1h",
+        "result": "./query_results.txt"
+      }
+    ]
+  }
+}
+```
+
+### Subscription configuration
+
+```json
+{
+  "filetype": "subscribe",
+  "host": "127.0.0.1",
+  "user": "root",
+  "password": "taosdata",
+  "tmq_info": {
+    "concurrent": 3,
+    "create_mode": "parallel",
+    "group_mode": "independent",
+    "poll_delay": -1,
+    "topic_list": [
+      {"name": "topic1", "sql": "SELECT * FROM test.meters"}
+    ]
+  }
+}
+```
+
+### Key supertable parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `childtable_count` | `10` | Number of subtables to create |
+| `insert_rows` | `0` | Rows per subtable |
+| `insert_mode` | `taosc` | `taosc`, `stmt`, `stmt2`, `sml` |
+| `interlace_rows` | `0` | Rows per subtable per round in interlaced mode |
+| `timestamp_step` | `1` | Timestamp increment per row (matches DB precision) |
+| `disorder_ratio` | `0` | Percentage of out-of-order rows (0–50) |
+| `thread_count` | `8` | Insert threads |
+| `batch_create_tbl_num` | `10` | Tables created per batch |
+| `data_source` | `rand` | `rand` or `sample` (from CSV file) |
+
+### Column and tag definition
+
+```json
+"columns": [
+  {"type": "float", "name": "current", "min": 1.0, "max": 100.0},
+  {"type": "int", "name": "voltage"},
+  {"type": "float", "count": 3, "name": "phase"}
+],
+"tags": [
+  {"type": "nchar", "name": "location", "len": 64},
+  {"type": "int", "name": "groupid"}
+]
+```
+
+`count` generates multiple columns of the same type. For example, `"count": 3, "name": "phase"` produces columns `phase`, `phase_2`, and `phase_3`.
+
+### Supported data types
+
+| TDengine type | taosBenchmark type |
+|---------------|-------------------|
+| TIMESTAMP | `timestamp` |
+| INT / INT UNSIGNED | `int` / `uint` |
+| BIGINT / BIGINT UNSIGNED | `bigint` / `ubigint` |
+| FLOAT | `float` |
+| DOUBLE | `double` |
+| BINARY / VARCHAR | `binary` / `varchar` |
+| NCHAR | `nchar` |
+| BOOL | `bool` |
+| SMALLINT / TINYINT | `smallint` / `tinyint` |
+| JSON | `json` |
+| DECIMAL | `decimal` |
+
+<Note>
+Data type names in the configuration file must be lowercase.
+</Note>
+
+## Output metrics
+
+### Insert metrics
+
+After writing completes, taosBenchmark prints a two-line summary:
+
+```text
+SUCC: Spent 8.527298 (real 8.117379) seconds to insert rows: 10000000 with 8 thread(s) into test 1172704.41 (real 1231924.74) records/second
+SUCC: insert delay, min: 19.6780ms, avg: 64.9390ms, p90: 94.6900ms, p95: 105.1870ms, p99: 130.6660ms, max: 157.0830ms
+```
+
+**Line 1 — throughput:**
+
+| Field | Description |
+|-------|-------------|
+| `Spent` | Total elapsed time (seconds), includes test framework overhead |
+| `real` | Engine-only time, excluding data preparation |
+| `rows` | Total rows written |
+| `threads` | Number of concurrent write threads |
+| `records/second` | Write throughput (rows/s); `real` value excludes framework time |
+
+**Line 2 — latency percentiles:**
+
+| Field | Description |
+|-------|-------------|
+| `min` | Minimum write request latency |
+| `avg` | Average write request latency |
+| `p90` / `p95` / `p99` | 90th/95th/99th percentile latencies |
+| `max` | Maximum write request latency |
+
+### Query metrics
+
+```text
+complete query with 3 threads and 10000 query delay avg: 0.002686s min: 0.001182s max: 0.012189s p90: 0.002977s p95: 0.003493s p99: 0.004645s SQL command: select ...
+INFO: Spend 26.9530 second completed total queries: 30000, the QPS of all threads: 1113.049
+```
+
+- **QPS** = successful requests ÷ total time (seconds)
+- **Error rate** = failed requests ÷ total requests
+
+### Subscription metrics
+
+```text
+INFO: consumer id 0 has poll total msgs: 376, period rate: 37.592 msgs/s, total rows: 3760000, period rate: 375924.815 rows/s
+INFO: consumerId: 0, consume msgs: 1000, consume rows: 10000000
+INFO: Consumed total msgs: 3000, total rows: 30000000
+```
+
+- `msgs/s`: consumption rate in messages per second
+- `rows/s`: consumption rate in data rows per second

@@ -1,0 +1,207 @@
+---
+title: "Telegraf"
+description: "How to use Telegraf to collect metrics and write them into TDengine via taosAdapter. Covers output plugin configuration, measurement-to-table mapping, and common input plugins."
+---
+
+[Telegraf](https://www.influxdata.com/time-series-platform/telegraf/) is a plugin-driven metrics collection agent. It collects system and application metrics from a wide range of input plugins and can write them to TDengine using the InfluxDB line protocol over HTTP.
+
+## Prerequisites
+
+- A TDengine cluster is deployed and running.
+- taosAdapter is installed and running (see [taosAdapter reference](/reference/components/taosadapter)).
+- Telegraf is installed. See the [official Telegraf installation docs](https://docs.influxdata.com/telegraf/v1.22/install/).
+
+## How it works
+
+Telegraf collects metrics through input plugins (CPU, memory, disk, network, etc.) and writes them to TDengine via taosAdapter's InfluxDB v1 write endpoint:
+
+```text
+Telegraf input plugins → outputs.http → taosAdapter /influxdb/v1/write → TDengine
+```
+
+Each Telegraf measurement maps to a TDengine supertable. Tags become TDengine tag columns; fields become data columns. The `host` tag is automatically added by Telegraf and serves as the subtable identifier.
+
+## Configuration
+
+### 1. Enable taosAdapter InfluxDB support
+
+In `/etc/taos/taosadapter.toml`, ensure the following are set:
+
+```toml
+# Auto-create the target database if it doesn't exist
+smlAutoCreateDB = true
+
+[influxdb]
+enable = true
+```
+
+Restart taosAdapter after editing the configuration:
+
+```bash
+systemctl restart taosadapter
+```
+
+### 2. Configure Telegraf output
+
+Add the `outputs.http` plugin to `/etc/telegraf/telegraf.conf`:
+
+```toml
+[[outputs.http]]
+  url = "http://127.0.0.1:6041/influxdb/v1/write?db=telegraf"
+  method = "POST"
+  timeout = "5s"
+  username = "root"
+  password = "taosdata"
+  data_format = "influx"
+```
+
+Replace `127.0.0.1` with the address of the server running taosAdapter. Replace `telegraf` with your target database name. Replace `root` and `taosdata` with your TDengine credentials.
+
+### 3. Enable input plugins
+
+Telegraf collects system metrics by default through these input plugins. To explicitly enable them in `telegraf.conf`:
+
+<CodeGroup>
+
+```toml CPU
+[[inputs.cpu]]
+  percpu = true
+  totalcpu = true
+  collect_cpu_time = false
+  report_active = false
+```
+
+```toml Memory
+[[inputs.mem]]
+  # No configuration required
+```
+
+```toml Disk
+[[inputs.disk]]
+  ignore_fs = ["tmpfs", "devtmpfs", "devfs", "overlay", "aufs", "squashfs"]
+```
+
+```toml Network
+[[inputs.net]]
+  interfaces = ["eth*", "en*", "lo"]
+```
+
+```toml System
+[[inputs.system]]
+  # No configuration required
+```
+
+</CodeGroup>
+
+### 4. Restart Telegraf
+
+```bash
+systemctl restart telegraf
+```
+
+## Verifying data flow
+
+Connect to TDengine and check that the `telegraf` database was created:
+
+```sql
+SHOW DATABASES;
+```
+
+Switch to it and list the supertables:
+
+```sql
+USE telegraf;
+SHOW STABLES;
+```
+
+You should see supertables matching Telegraf measurement names:
+
+```text
+ cpu
+ mem
+ disk
+ system
+ diskio
+ swap
+ kernel
+ processes
+```
+
+Query the `system` supertable to verify data is arriving:
+
+```sql
+SELECT * FROM telegraf.system LIMIT 10;
+```
+
+## Mapping Telegraf measurements to TDengine tables
+
+TDengine's schemaless write interface handles the schema automatically:
+
+| Telegraf concept | TDengine concept |
+|-----------------|-----------------|
+| Measurement name | Supertable name |
+| Tag key=value | Tag column |
+| Field key=value | Data column |
+| Timestamp | Primary key (`ts`) |
+| `host` tag value | Subtable name (auto-generated) |
+
+By default, subtable names are generated from a hash of the tag set. To control subtable naming, set `smlChildTableName` in `taos.cfg`:
+
+```text
+smlChildTableName = tname
+```
+
+Then include a tag named `tname` in your Telegraf data. The value of that tag becomes the subtable name.
+
+## Complete example configuration
+
+```toml
+# Global Telegraf configuration
+[global_tags]
+  environment = "production"
+
+[agent]
+  interval = "10s"
+  round_interval = true
+  metric_batch_size = 1000
+  metric_buffer_limit = 10000
+  collection_jitter = "0s"
+  flush_interval = "10s"
+
+# Input plugins
+[[inputs.cpu]]
+  percpu = true
+  totalcpu = true
+  collect_cpu_time = false
+  report_active = false
+
+[[inputs.mem]]
+
+[[inputs.disk]]
+  ignore_fs = ["tmpfs", "devtmpfs", "devfs"]
+
+[[inputs.net]]
+
+[[inputs.system]]
+
+# Output to TDengine via taosAdapter
+[[outputs.http]]
+  url = "http://127.0.0.1:6041/influxdb/v1/write?db=telegraf"
+  method = "POST"
+  timeout = "5s"
+  username = "root"
+  password = "taosdata"
+  data_format = "influx"
+```
+
+## Visualizing Telegraf data in Grafana
+
+After data is flowing into TDengine, import Grafana dashboard **16388** to visualize node metrics collected by Telegraf:
+
+1. In Grafana, go to **Dashboards → Import**.
+2. Enter dashboard ID `16388` and click **Load**.
+3. Select your TDengine datasource and click **Import**.
+
+<Tip>
+You can write custom queries against `telegraf.cpu`, `telegraf.mem`, and other supertables to build tailored Grafana panels. Use `PARTITION BY host` to display per-host series.
+</Tip>

@@ -1,0 +1,398 @@
+---
+title: "TDgpt AI Analytics"
+description: "TDgpt is TDengine's built-in AI agent for time-series analytics — run forecasting and anomaly detection directly in SQL without leaving your database."
+---
+
+TDgpt is an intelligent analytics agent built into TDengine that lets you run advanced time-series analysis directly from SQL. You can invoke statistical algorithms, machine learning models, deep learning models, time-series foundation models, and large language models — all through SQL statements, against your data in TDengine.
+
+TDgpt exposes its capabilities through two new SQL constructs:
+
+- **`FORECAST()`** — predict future values based on historical time-series data
+- **`ANOMALY_WINDOW()`** — detect anomalies and return the time windows in which they occurred
+
+## What TDgpt Can Do
+
+<CardGroup cols={2}>
+  <Card title="Time-Series Forecasting" icon="chart-line">
+    Predict future values from historical data using statistical, ML, deep learning, or foundation models.
+  </Card>
+  <Card title="Anomaly Detection" icon="triangle-exclamation">
+    Identify time windows where anomalies occur using IQR, k-sigma, Grubbs, LOF, and other algorithms.
+  </Card>
+  <Card title="Data Imputation" icon="fill-drip">
+    Fill in missing values in time series. (Releasing July 2025)
+  </Card>
+  <Card title="Time-Series Classification" icon="tags">
+    Classify time-series segments into categories. (Releasing July 2025)
+  </Card>
+</CardGroup>
+
+## Architecture
+
+TDgpt is composed of one or more stateless **AI nodes (anodes)**. Anodes can be deployed across the TDengine cluster on hardware appropriate for the algorithms being used — including GPU-equipped machines for deep learning workloads.
+
+During query execution, the vnode in TDengine forwards any advanced analytics elements to the anode. Once analysis is complete, results are assembled and embedded back into the query execution flow.
+
+TDgpt includes four main components:
+
+- **Built-in analytics libraries**: statsmodels, pyculiarity, pmdarima — ready-to-use models for forecasting and anomaly detection.
+- **Built-in ML libraries**: PyTorch, Keras, Scikit-learn — for running pre-trained machine and deep learning models.
+- **Adapter for locally deployed time-series models**: Connects to Time-MoE and TDtsfm, which are purpose-built for time-series data and are lighter-weight than general-purpose LLMs.
+- **Adapter for cloud time-series MaaS**: Connects to cloud-hosted services such as TimeGPT.
+
+## System Requirements
+
+The following specifications apply to the machine running the anode.
+
+### Inference Only (Forecasting and Anomaly Detection)
+
+| Specification | Minimum | Recommended |
+|---------------|---------|-------------|
+| CPU | 8 cores | 16 cores |
+| Memory | 16 GB | 32 GB |
+| Storage | 200 GB SSD | 500 GB SSD |
+| GPU | Optional | NVIDIA GPU with 24 GB VRAM |
+| Network | — | 1 Gbps (10 Gbps for high-throughput) |
+
+### Training or Fine-Tuning
+
+| Specification | Minimum | Recommended |
+|---------------|---------|-------------|
+| CPU | 16 cores | 32 cores |
+| Memory | 32 GB | 64 GB |
+| Storage | 500 GB SSD | 1 TB |
+| GPU | NVIDIA GPU with 24 GB VRAM | At least one NVIDIA GPU with 24 GB VRAM |
+
+<Note>
+TDgpt can operate without a GPU for inference. Adding a GPU significantly improves latency and throughput.
+</Note>
+
+## Installation
+
+### Docker (Recommended)
+
+Two Docker images are available:
+
+| Image | Included Models |
+|-------|-----------------|
+| `tdengine/tdgpt` | TDtsfm v1.0 |
+| `tdengine/tdgpt-full` | TDtsfm v1.0 and Time-MoE |
+
+<Steps>
+  <Step title="Pull the image">
+    ```bash
+    docker pull tdengine/tdgpt:latest
+    ```
+    Or for the full image with Time-MoE:
+    ```bash
+    docker pull tdengine/tdgpt-full:latest
+    ```
+  </Step>
+  <Step title="Start the container">
+    ```bash
+    docker run -d \
+      -p 6035:6035 \
+      -p 6061:6061 \
+      tdengine/tdgpt:latest
+    ```
+    For the full image (also exposes the Time-MoE model service on port 6062):
+    ```bash
+    docker run -d -p 6035:6035 -p 6061:6061 -p 6062:6062 tdengine/tdgpt-full:latest
+    ```
+
+    Port reference:
+    - `6035`: TDgpt REST service
+    - `6061`: TDtsfm model service
+    - `6062`: Time-MoE model service
+  </Step>
+  <Step title="Confirm the container is running">
+    ```bash
+    docker ps
+    ```
+  </Step>
+</Steps>
+
+<Note>
+From version 3.3.7.5, the TDgpt port changed from 6090 to 6035.
+</Note>
+
+### Local Installation
+
+**Prerequisites**:
+- Python 3.10 or 3.11 (3.12 is not supported due to library conflicts)
+- TDengine TSDB 3.3.6.0 or later
+- A C compiler (for PyTorch dynamic code generation)
+
+<Steps>
+  <Step title="Install Python 3.10">
+    ```bash
+    sudo apt-get install software-properties-common
+    sudo add-apt-repository ppa:deadsnakes/ppa
+    sudo apt update
+    sudo apt install python3.10 python3.10-venv python3.10-dev
+    sudo update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 2
+    ```
+  </Step>
+  <Step title="Install pip">
+    ```bash
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10
+    export PATH=$PATH:~/.local/bin
+    ```
+  </Step>
+  <Step title="Install a C compiler">
+    ```bash
+    sudo apt update && sudo apt install build-essential
+    ```
+  </Step>
+  <Step title="Download and install TDgpt">
+    Download the tar.gz package, decompress it, and run the install script:
+    ```bash
+    tar -zxvf tdengine-tdgpt-oss-<VERSION>-linux-x64.tar.gz
+    cd tdengine-tdgpt-oss-<VERSION>-linux-x64
+    ./install.sh
+    ```
+    The installer creates a Python virtual environment at `/var/lib/taos/taosanode/venv/` and installs all dependencies there.
+  </Step>
+  <Step title="Start the service">
+    ```bash
+    systemctl start taosanoded
+    systemctl status taosanoded
+    ```
+  </Step>
+</Steps>
+
+### Register the Anode with TDengine
+
+After the anode is running, register it with your TDengine cluster from the TDengine CLI:
+
+```sql
+CREATE ANODE '192.168.0.1:6035';
+```
+
+Verify registration:
+
+```sql
+SHOW ANODES;
+```
+
+```
+     id      |              url               |    status    |       create_time       |
+========================================================================================
+           1 | 192.168.0.1:6035               | ready        | 2024-11-28 18:44:27.089 |
+```
+
+View all available algorithms and models:
+
+```sql
+SHOW ANODES FULL;
+```
+
+```
+     id      |            type            |              algo              |
+============================================================================
+           1 | anomaly-detection          | grubbs                         |
+           1 | anomaly-detection          | lof                            |
+           1 | anomaly-detection          | shesd                          |
+           1 | anomaly-detection          | ksigma                         |
+           1 | anomaly-detection          | iqr                            |
+           1 | forecast                   | arima                          |
+           1 | forecast                   | holtwinters                    |
+           1 | forecast                   | tdtsfm_1                       |
+           1 | forecast                   | timemoe-fc                     |
+```
+
+## Time-Series Forecasting with FORECAST()
+
+The `FORECAST()` function takes historical time-series data as input and returns predicted future values.
+
+### Syntax
+
+```sql
+FORECAST(column_expr, option_expr)
+
+option_expr: {"
+  algo=expr1
+  [,wncheck=1|0]
+  [,conf=conf_val]
+  [,every=every_val]
+  [,rows=rows_val]
+  [,start=start_ts_val]
+  [,expr2]
+"}
+```
+
+### Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `algo` | Forecasting algorithm to use | `holtwinters` |
+| `wncheck` | White noise check: `1` to enable, `0` to disable | `1` |
+| `conf` | Confidence interval (0–100) | `95` |
+| `every` | Sampling period for forecast output | Sampling period of input data |
+| `start` | Starting timestamp for forecast data | One period after the last input timestamp |
+| `rows` | Number of forecast rows to return (max 1024) | `10` |
+
+### Pseudocolumns
+
+Three pseudocolumns are available in forecast results:
+
+| Pseudocolumn | Description |
+|-------------|-------------|
+| `_FROWTS` | Timestamp of the forecast data point |
+| `_FLOW` | Lower bound of the confidence interval |
+| `_FHIGH` | Upper bound of the confidence interval |
+
+### Examples
+
+```sql
+-- ARIMA forecast: 10 rows (default), white noise check enabled, 95% confidence interval
+SELECT _flow, _fhigh, _frowts, FORECAST(i32, "algo=arima")
+FROM foo;
+
+-- ARIMA forecast with periodic data: 10 samples per period, white noise check disabled
+SELECT _flow, _fhigh, _frowts, FORECAST(i32, "algo=arima,alpha=95,period=10,wncheck=0")
+FROM foo;
+```
+
+Sample output:
+
+```
+        _flow         |        _fhigh        |       _frowts           | forecast(i32) |
+========================================================================================
+           10.5286684 |           41.8038254 | 2020-01-01 00:01:35.000 |            26 |
+          -21.9861946 |           83.3938904 | 2020-01-01 00:01:36.000 |            30 |
+          -78.5686035 |          144.6729126 | 2020-01-01 00:01:37.000 |            33 |
+         -154.9797363 |          230.3057709 | 2020-01-01 00:01:38.000 |            37 |
+         -253.9852905 |          337.6083984 | 2020-01-01 00:01:39.000 |            41 |
+```
+
+### TDengine Cloud
+
+You can try TDgpt on a free TDengine Cloud account. Open **DB Mart**, enable the **Time Series Prediction Analysis Dataset** database, and run:
+
+```sql
+SELECT forecast(val, 'algo=tdtsfm_1') FROM forecast.electricity_demand;
+```
+
+### Built-In Forecasting Algorithms
+
+| Algorithm | Category |
+|-----------|----------|
+| `arima` | Statistical (ARIMA) |
+| `holtwinters` | Statistical (exponential smoothing) |
+| `ces` | Complex exponential smoothing |
+| `theta` | Statistical |
+| `prophet` | Statistical |
+| `mstl` | Multiple Seasonal-Trend decomposition using LOESS |
+| `ets` | Error, Trend, Seasonal |
+| `xgboost` | Machine learning |
+| `lightgbm` | Machine learning |
+| `lstm` | Deep learning |
+| `mlp` | Multilayer Perceptron |
+| `deepar` | Deep learning |
+| `nbeats` | Deep learning (N-BEATS) |
+| `nhits` | Deep learning (N-HiTS) |
+| `patchtst` | Transformer (PatchTST) |
+| `tft` | Temporal Fusion Transformer |
+| `timesnet` | Deep learning |
+| `tdtsfm_1` | TDengine foundation model (TDtsfm v1.0) |
+| `timemoe-fc` | Time-MoE foundation model |
+
+## Anomaly Detection with ANOMALY\_WINDOW()
+
+`ANOMALY_WINDOW` is a new type of window clause that identifies time ranges containing anomalies. You use it in a `WHERE` clause, and aggregate queries against the detected anomaly windows.
+
+### Syntax
+
+```sql
+ANOMALY_WINDOW(column_name, option_expr)
+
+option_expr: {"
+  algo=expr1
+  [,wncheck=1|0]
+  [,expr2]
+"}
+```
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `algo` | Anomaly detection algorithm | `iqr` |
+| `wncheck` | White noise check: `1` to enable, `0` to disable | `1` |
+
+Three pseudocolumns describe each anomaly window:
+
+| Pseudocolumn | Description |
+|-------------|-------------|
+| `_WSTART` | Start timestamp of the anomaly window |
+| `_WEND` | End timestamp of the anomaly window |
+| `_WDURATION` | Duration of the anomaly window |
+
+### Examples
+
+```sql
+-- Detect anomalies in i32 using the default IQR algorithm.
+-- Return the anomaly window boundaries and the sum of i32 within it.
+SELECT _wstart, _wend, SUM(i32)
+FROM foo
+ANOMALY_WINDOW(i32, "algo=iqr");
+
+-- Use the k-sigma algorithm with k=2.
+SELECT _wstart, _wend, SUM(i32)
+FROM foo
+ANOMALY_WINDOW(i32, "algo=ksigma,k=2");
+```
+
+Sample output:
+
+```
+         _wstart         |          _wend          |   count(*)    |
+====================================================================
+ 2020-01-01 00:00:16.000 | 2020-01-01 00:00:17.000 |             2 |
+```
+
+You can also use `ANOMALY_WINDOW` as the inner query in a nested query, with all the same aggregation functions available for other windowed queries.
+
+### Built-In Anomaly Detection Algorithms
+
+| Category | Algorithm | Description |
+|----------|-----------|-------------|
+| Statistical | `iqr` | Interquartile range (default) |
+| Statistical | `ksigma` | K-sigma outlier detection |
+| Statistical | `grubbs` | Grubbs test |
+| Density-based | `lof` | Local Outlier Factor |
+| Seasonal | `shesd` | Seasonal ESD |
+| ML | `sample_ad_model` | Autoencoder-based model |
+
+## Managing Anodes
+
+### Refresh Algorithm Cache
+
+After adding a custom algorithm or updating models, refresh the algorithm cache:
+
+```sql
+UPDATE ANODE 1;
+-- or refresh all anodes at once:
+UPDATE ALL ANODES;
+```
+
+### Remove an Anode
+
+```sql
+DROP ANODE 1;
+```
+
+<Note>
+Dropping an anode only removes it from the TDengine cluster registry. To stop the anode process, use `systemctl stop taosanoded` on the anode machine. To fully uninstall it, run `rmtaosanode`.
+</Note>
+
+## Custom Algorithms
+
+TDgpt is an open platform. You can add your own forecasting, anomaly detection, imputation, or classification algorithms in Python. Once added, you reference them by name in SQL — no application code changes required.
+
+To add a custom algorithm:
+
+1. Implement the algorithm following TDgpt's interface requirements.
+2. Place the source files in the appropriate anode directory and restart the anode.
+3. Refresh the algorithm cache with `UPDATE ANODE` or `UPDATE ALL ANODES`.
+
+You can then use your algorithm by setting `algo=your_algorithm_name` in any `FORECAST()` or `ANOMALY_WINDOW()` call.

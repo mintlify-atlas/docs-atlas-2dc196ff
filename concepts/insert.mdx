@@ -1,0 +1,160 @@
+---
+title: "Data Ingestion"
+description: "Insert time-series data into TDengine using SQL, batch writes, automatic table creation, and schemaless protocols."
+---
+
+TDengine accepts data through standard SQL `INSERT` statements as well as schemaless protocols compatible with InfluxDB, OpenTSDB, and other systems. This page uses the smart meter data model — supertable `meters` with metrics `current`, `voltage`, `phase` and tags `location`, `group_id` — to demonstrate each approach.
+
+## SQL inserts
+
+### Insert a single record
+
+The most basic insert writes one row to a subtable:
+
+```sql
+INSERT INTO d1001 (ts, current, voltage, phase)
+VALUES ("2018-10-03 14:38:05", 10.3, 219, 0.31);
+```
+
+When your `VALUES` clause includes all columns in the table's defined order, you can omit the column list:
+
+```sql
+INSERT INTO d1001 VALUES ("2018-10-03 14:38:05", 10.3, 219, 0.31);
+```
+
+You can also use a raw millisecond Unix timestamp instead of a formatted string:
+
+```sql
+INSERT INTO d1001 VALUES (1538548685000, 10.3, 219, 0.31);
+```
+
+All three statements above produce the same result.
+
+### Insert multiple records at once
+
+If a device reports data in batches, write all rows in a single statement to reduce round-trips:
+
+```sql
+INSERT INTO d1001 VALUES
+    ("2018-10-03 14:38:05", 10.2, 220, 0.23),
+    ("2018-10-03 14:38:15", 12.6, 218, 0.33),
+    ("2018-10-03 14:38:25", 12.3, 221, 0.31);
+```
+
+### Insert into multiple tables at once
+
+You can write to several subtables in a single `INSERT` statement. This is particularly efficient when collecting data from many devices at the same ingestion interval:
+
+```sql
+INSERT INTO d1001 VALUES
+        ("2018-10-03 14:38:05", 10.2, 220, 0.23),
+        ("2018-10-03 14:38:15", 12.6, 218, 0.33),
+        ("2018-10-03 14:38:25", 12.3, 221, 0.31)
+    d1002 VALUES
+        ("2018-10-03 14:38:04", 10.2, 220, 0.23),
+        ("2018-10-03 14:38:14", 10.3, 218, 0.25),
+        ("2018-10-03 14:38:24", 10.1, 220, 0.22)
+    d1003 VALUES
+        ("2018-10-03 14:38:06", 11.5, 221, 0.35),
+        ("2018-10-03 14:38:16", 10.4, 220, 0.36),
+        ("2018-10-03 14:38:26", 10.3, 220, 0.33);
+```
+
+This single statement writes 9 rows across 3 subtables.
+
+<Tip>
+Batch inserts that combine multiple rows and multiple tables in one statement provide the best write throughput. TDengine's write path is optimized for sequential, append-only operations within each subtable.
+</Tip>
+
+### Insert specific columns
+
+If some columns are not available for a given reading, specify only the columns you have. TDengine fills the remaining metric columns with NULL. The timestamp column must always be present and cannot be NULL:
+
+```sql
+INSERT INTO d1004 (ts, voltage, phase)
+VALUES ("2018-10-04 14:38:06", 223, 0.29);
+```
+
+This writes a row for `d1004` where `current` is NULL.
+
+### Automatic table creation on insert
+
+In high-volume IoT pipelines, devices may start reporting before their tables are manually created. Use the `USING ... TAGS` clause to let TDengine create the subtable automatically on the first insert:
+
+```sql
+INSERT INTO d1005
+USING meters (location)
+TAGS ("California.SanFrancisco")
+VALUES ("2018-10-04 14:38:07", 10.15, 217, 0.33);
+```
+
+If `d1005` does not exist, TDengine creates it with `location = "California.SanFrancisco"` and `group_id = NULL`, then inserts the row. If `d1005` already exists, TDengine inserts directly.
+
+You can combine automatic table creation with multi-table batch inserts:
+
+```sql
+INSERT INTO
+    d1001 USING meters TAGS ("California.SanFrancisco", 2) VALUES
+        ("2018-10-03 14:38:05", 10.2, 220, 0.23),
+        ("2018-10-03 14:38:15", 12.6, 218, 0.33),
+        ("2018-10-03 14:38:25", 12.3, 221, 0.31)
+    d1002 USING meters TAGS ("California.SanFrancisco", 3) VALUES
+        ("2018-10-03 14:38:04", 10.2, 220, 0.23),
+        ("2018-10-03 14:38:14", 10.3, 218, 0.25),
+        ("2018-10-03 14:38:24", 10.1, 220, 0.22)
+    d1003 USING meters TAGS ("California.LosAngeles", 2) VALUES
+        ("2018-10-03 14:38:06", 11.5, 221, 0.35),
+        ("2018-10-03 14:38:16", 10.4, 220, 0.36),
+        ("2018-10-03 14:38:26", 10.3, 220, 0.33);
+```
+
+### Insert via supertable
+
+You can write data directly to a supertable by specifying the target subtable name in the `tbname` pseudocolumn. TDengine routes the row to the correct subtable:
+
+```sql
+INSERT INTO meters (tbname, ts, current, voltage, phase, location, group_id)
+VALUES ("d1001", "2018-10-03 14:38:05", 10.2, 220, 0.23, "California.SanFrancisco", 2);
+```
+
+<Note>
+A supertable is a template and does not store data itself. This statement writes the row to the subtable `d1001`; the supertable name is used only for routing and schema lookup.
+</Note>
+
+## Updating data
+
+Time-series data is updated by inserting a new row with a duplicate timestamp. The new values replace the old ones:
+
+```sql
+INSERT INTO d1001 (ts, current)
+VALUES ("2018-10-03 14:38:05", 22);
+```
+
+This updates the `current` column for the row at `2018-10-03 14:38:05` in subtable `d1001`. The `voltage` and `phase` columns remain unchanged.
+
+## Deleting data
+
+To remove erroneous or stale data, use `DELETE` with a time-range condition:
+
+```sql
+DELETE FROM meters WHERE ts < '2021-10-01 10:40:00.100';
+```
+
+<Warning>
+Data deletion is irreversible. Before running a `DELETE` statement, run the equivalent `SELECT` first to confirm you are targeting the correct rows.
+</Warning>
+
+## Zero-code integrations
+
+TDengine integrates directly with popular data collection and messaging tools, so you can ingest data without writing custom insert code. Supported integrations include:
+
+<CardGroup cols={3}>
+  <Card title="Telegraf" icon="bolt" />
+  <Card title="Prometheus" icon="chart-line" />
+  <Card title="EMQX" icon="wifi" />
+  <Card title="StatsD" icon="gauge" />
+  <Card title="collectd" icon="server" />
+  <Card title="HiveMQ" icon="message" />
+</CardGroup>
+
+TDengine Enterprise extends this list with connectors for MQTT, OPC, AVEVA PI System, Wonderware, Kafka, MySQL, Oracle, and more. Configure the connection on the TDengine side and data flows in automatically.

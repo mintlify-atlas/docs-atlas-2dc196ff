@@ -1,0 +1,336 @@
+---
+title: "Performance Tuning"
+description: "Tune TDengine write throughput, query latency, and memory usage for high-concurrency IoT workloads."
+---
+
+TDengine is designed for high-throughput time-series workloads. Most production performance issues stem from suboptimal batch sizes, misconfigured caching, insufficient hardware, or missing pre-aggregation for expensive queries. This page covers the key knobs and patterns for each area.
+
+## Hardware recommendations
+
+| Resource | Recommendation |
+|----------|---------------|
+| CPU | Each CPU core serves 1–2 vnodes. Keep CPU usage below 50% in steady state. |
+| Memory | Use the formula `vgroups × replica × (buffer + pages × pagesize + cachesize)` to estimate per-database memory. Multiply by the number of databases and add OS overhead. |
+| Storage | Use SSD for the primary data tier. TDengine supports multiple mount points for parallel I/O. Set `dataDir` multiple times in `taos.cfg` for concurrent writes across disks. |
+| Network | 10 Gb/s between cluster nodes. Keep packet loss below 0.01%. Use a dedicated VLAN for inter-node traffic. |
+| Swap | Disable swap. TDengine performs poorly when swapping. |
+
+## Write performance optimization
+
+### Batch writes
+
+Write throughput scales with batch size. A single-core can write 10,000 requests per second. Writing 1 record per request versus 10 records per request consumes similar CPU, so batching is critical:
+
+- A batch of 200+ rows per request allows a single core to sustain ~1 million rows/second.
+- Use parameter binding (`stmt`) for the lowest write latency.
+- Avoid sending one row at a time.
+
+### Key database parameters for writes
+
+Set these when creating a database or alter them afterward:
+
+```sql
+CREATE DATABASE power
+  VGROUPS 10          -- number of vgroups; scale with data volume and node count
+  REPLICA 3           -- 3 for HA clusters
+  BUFFER 256          -- write buffer per vnode (MB); default 96
+  PAGES 256           -- number of cache pages per vnode
+  PAGESIZE 4          -- cache page size (KB); default 4
+  WAL_LEVEL 2         -- 1 = no fsync (fastest), 2 = fsync (durable)
+  WAL_FSYNC_PERIOD 3000 -- fsync interval in ms when WAL_LEVEL = 2
+  CACHEMODEL 'both'   -- cache last_row and last_value per child table
+  CACHESIZE 32;       -- last-value cache memory per vnode (MB)
+```
+
+<Tip>
+`WAL_LEVEL 1` maximizes write speed at the cost of potential data loss on crash. Use `WAL_LEVEL 2` for production where durability matters.
+</Tip>
+
+### Commit interval tuning
+
+The `commitTime` parameter (in `taos.cfg`) controls how often in-memory data is flushed to disk. The default is 3600 seconds. Lowering it reduces recovery time after a crash but increases I/O load:
+
+```shell
+# In /etc/taos/taos.cfg
+commitTime 3600
+```
+
+### Vgroup count
+
+More vgroups distribute write load across more CPU cores and disks. A guideline: total vgroups ≈ 2 × CPU core count. Set `VGROUPS` at database creation; it cannot be changed afterward.
+
+### taosAdapter tuning
+
+When running multiple taosAdapter instances behind a load balancer, each instance maintains its own connection pool to taosd. Monitor `taos_adapter_requests_write_fail` in the `log` database to detect overload.
+
+## Query performance optimization
+
+### Last-row queries
+
+The `CACHEMODEL` parameter dramatically affects `LAST_ROW` and `LAST` query speed:
+
+| Value | Effect |
+|-------|--------|
+| `none` | Every `last_row` query scans disk |
+| `last_row` | Caches the last row per child table in memory |
+| `last_value` | Caches the last non-NULL value per column |
+| `both` | Both caches enabled |
+
+```sql
+-- Enable both caches on an existing database
+ALTER DATABASE power CACHEMODEL 'both';
+```
+
+For IoT workloads with frequent "get the latest reading" queries, `last_row` or `both` is strongly recommended.
+
+### Time-range filtering
+
+Always include a time range condition in queries that scan large datasets. TDengine stores data in time-ordered blocks; a time filter allows block skipping:
+
+```sql
+-- Inefficient: full table scan
+SELECT avg(current) FROM meters WHERE location = 'Beijing';
+
+-- Efficient: time-bounded scan
+SELECT avg(current) FROM meters
+WHERE ts >= '2024-01-01' AND ts < '2024-02-01' AND location = 'Beijing';
+```
+
+### Aggregation with PARTITION BY
+
+Use `PARTITION BY` (formerly `GROUP BY` with supertable tags) to aggregate across child tables efficiently:
+
+```sql
+SELECT location, avg(current), max(voltage)
+FROM meters
+WHERE ts > NOW - 1h
+PARTITION BY location;
+```
+
+### TSMA: time-series materialized aggregation
+
+TSMA pre-computes aggregates (AVG, SUM, COUNT, MAX, MIN, etc.) at a fixed time interval and stores the results. Queries that fit the TSMA window use the pre-computed results instead of scanning raw data, dramatically reducing query latency for dashboard workloads.
+
+Create a TSMA:
+
+```sql
+-- Pre-compute 1-minute aggregates for meters supertable
+CREATE TSMA meters_1m ON power.meters FUNCTION (AVG(current), MAX(voltage), MIN(phase))
+  INTERVAL(1m);
+```
+
+TDengine automatically uses the TSMA when a query interval matches or is a multiple of the TSMA interval. You do not need to change your SQL.
+
+```sql
+-- This query will use meters_1m TSMA transparently
+SELECT AVG(current), MAX(voltage)
+FROM power.meters
+WHERE ts >= '2024-01-01' AND ts < '2024-01-02'
+INTERVAL(1m);
+```
+
+<Note>
+TSMA is available in TDengine Enterprise. Use `GRANT CREATE TSMA ON TABLE power.meters TO dba_user;` to control who can create TSMAs.
+</Note>
+
+### Query node (qnode)
+
+For a cluster under heavy query load, create a dedicated qnode to offload query processing from dnodes:
+
+```sql
+CREATE QNODE ON DNODE 3;
+SHOW QNODES;
+```
+
+## Memory allocator configuration
+
+TDengine ships a script `set_taos_malloc.sh` to switch the memory allocator for `taosd` and `taosadapter`:
+
+```bash
+# Use jemalloc for optimized memory allocation (recommended for production)
+/usr/local/taos/bin/set_taos_malloc.sh -m 3
+
+# Use tcmalloc
+/usr/local/taos/bin/set_taos_malloc.sh -m 1
+
+# Revert to glibc default
+/usr/local/taos/bin/set_taos_malloc.sh -m 0
+```
+
+| Mode | Allocator |
+|------|-----------|
+| `0` | glibc default |
+| `1` | tcmalloc (optimized) |
+| `2` | tcmalloc (memory leak detection) |
+| `3` | jemalloc (optimized) |
+| `4` | jemalloc (memory leak detection) |
+
+After switching, restart `taosd` and `taosadapter`:
+
+```bash
+systemctl restart taosd
+systemctl restart taosadapter
+```
+
+The script generates environment variable files at `/etc/default/taosd` and `/etc/default/taosadapter`.
+
+## Multi-tier storage
+
+TDengine can automatically migrate older data to cheaper storage (e.g., spinning disks or object storage) while keeping recent data on fast SSDs. Configure multiple `dataDir` entries in `taos.cfg` with tier levels:
+
+```shell
+# Tier 0: hot data on SSD (primary, keep recent data)
+dataDir /data/ssd0  0  1
+# Tier 1: warm data on HDD
+dataDir /data/hdd0  1  0
+# Tier 2: cold data on second HDD
+dataDir /data/hdd1  2  0
+```
+
+The format is `dataDir <path> <tier_level> <primary_flag>`. Data migration between tiers happens automatically based on the `keep` parameters. SQL queries transparently span all tiers.
+
+## Benchmarking with taosBenchmark
+
+taosBenchmark is bundled with TDengine and tests insert, query, and subscription performance.
+
+### Quick write benchmark (default mode)
+
+```bash
+taosBenchmark
+```
+
+This creates the `test` database, a `meters` supertable, 10,000 child tables, and inserts 10,000 rows per table using the default configuration.
+
+### Custom write benchmark
+
+```bash
+taosBenchmark -d mydb -t 100 -n 1000 -T 4 -I stmt -y
+```
+
+- `-d mydb`: Database name
+- `-t 100`: Number of child tables
+- `-n 1000`: Rows per table
+- `-T 4`: Number of write threads
+- `-I stmt`: Use parameter binding (lowest latency)
+- `-y`: Skip confirmation prompts
+
+### JSON configuration file mode
+
+Use a JSON file for full control over the benchmark:
+
+```bash
+taosBenchmark -f benchmark.json
+```
+
+Example `benchmark.json` for a smart meter workload:
+
+```json
+{
+  "filetype": "insert",
+  "cfgdir": "/etc/taos",
+  "host": "localhost",
+  "port": 6030,
+  "user": "root",
+  "password": "taosdata",
+  "databases": [{
+    "dbinfo": {
+      "name": "test",
+      "drop": "yes",
+      "vgroups": 10,
+      "replica": 1,
+      "buffer": 256,
+      "cachemodel": "both"
+    },
+    "super_tables": [{
+      "name": "meters",
+      "child_table_exists": "no",
+      "childtable_count": 10000,
+      "insert_rows": 1000,
+      "interlace_rows": 100,
+      "insert_interval": 0,
+      "batch_create_tbl_num": 100,
+      "num_of_records_per_req": 100,
+      "columns": [
+        {"type": "FLOAT", "name": "current"},
+        {"type": "INT", "name": "voltage"},
+        {"type": "FLOAT", "name": "phase"}
+      ],
+      "tags": [
+        {"type": "BINARY", "name": "location", "len": 24},
+        {"type": "INT", "name": "groupId"}
+      ]
+    }]
+  }]
+}
+```
+
+### Estimating compression ratio
+
+After a write benchmark, measure actual compression:
+
+```bash
+taos> flush database test;
+$ du -hd1 /var/lib/taos/vnode --exclude=wal
+```
+
+Divide raw data size by the `du` output to get the compression ratio.
+
+## Benchmarking queries with JMeter
+
+For query performance testing, use JMeter with the TDengine JDBC WebSocket driver.
+
+### Setup
+
+1. Download the TDengine JDBC driver (`taos-jdbcdriver-*-dist.jar`) from the Maven repository.
+2. Copy it to `$JMETER_HOME/lib/ext/`.
+3. Use the WebSocket driver class: `com.taosdata.jdbc.ws.WebSocketDriver`
+4. Connect URL format: `jdbc:TAOS-WS://host1:6041,host2:6041,host3:6041/dbname?timezone=Asia/Shanghai`
+
+### Run a query benchmark
+
+```bash
+export JVM_ARGS="-Xms4g -Xmx4g -XX:+UseG1GC"
+jmeter -n -t my_test.jmx -l results.jtl
+jmeter -g results.jtl -o report/
+```
+
+Key metrics from the JMeter HTML report:
+
+| Metric | Meaning |
+|--------|---------|
+| Throughput | Queries per second (QPS) |
+| Average | Average response time |
+| 90% Line | 90th percentile response time |
+| 99% Line | 99th percentile response time |
+| Error% | Request error rate |
+
+### Identifying bottlenecks
+
+Use taosKeeper and TDinsight to correlate JMeter metrics with server-side data:
+
+- **QPS flat despite adding threads** → CPU or network bound on the server
+- **Response time spikes** → disk I/O saturation or memory pressure
+- **Error rate rising** → connection pool exhausted or query timeouts
+
+Check these system settings before running performance tests:
+
+```bash
+ulimit -n 65535          # file handle limit
+sysctl vm.swappiness     # should be 1–10 for servers
+swapon --show            # should be empty
+```
+
+## System settings checklist
+
+Before going to production, verify:
+
+| Setting | Recommendation |
+|---------|---------------|
+| `ulimit -n` | 65535 |
+| Swap | Disabled |
+| `vm.swappiness` | 1–10 |
+| Network between nodes | 10 Gb/s, packet loss < 0.01% |
+| Storage for hot data | SSD with read/write latency < 1 ms |
+| TDengine `CACHEMODEL` | `last_row` or `both` for IoT workloads |
+| Write batch size | 200+ rows per request |
+| `WAL_LEVEL` | `2` for durable production deployments |

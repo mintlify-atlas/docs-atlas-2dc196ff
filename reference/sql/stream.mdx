@@ -1,0 +1,485 @@
+---
+title: "Stream Processing"
+description: "SQL reference for TDengine stream processing: CREATE STREAM syntax, trigger types, window options, watermarks, notifications, and stream management."
+---
+
+TDengine stream processing provides real-time continuous computation over incoming data. Streams decouple the **trigger** (what drives computation) from the **computation** (what is calculated), enabling flexible event-driven pipelines.
+
+<Note>
+The redesigned stream processing engine requires **v3.3.7.0** or later. Streams from earlier versions must be dropped and recreated after upgrading.
+</Note>
+
+## Prerequisites
+
+Stream processing requires at least one **snode** (stream processing node) in the cluster.
+
+```sql
+-- Create an snode on a specific dnode
+CREATE SNODE ON DNODE dnode_id;
+
+-- View snodes
+SHOW SNODES;
+SELECT * FROM information_schema.ins_snodes;
+
+-- Remove an snode (both snode and its replica must be online)
+DROP SNODE ON DNODE dnode_id;
+```
+
+---
+
+## CREATE STREAM
+
+```sql
+CREATE STREAM [IF NOT EXISTS] [db_name.]stream_name
+  trigger_type
+  [FROM [db_name.]table_name]
+  [PARTITION BY col1 [, ...]]
+  [STREAM_OPTIONS(stream_option [|...])]
+  [notification_definition]
+  [INTO [db_name.]table_name]
+    [NODELAY_CREATE_SUBTABLE]
+    [OUTPUT_SUBTABLE(tbname_expr)]
+    [(column_name1 [COMPOSITE KEY], column_name2, ...)]
+    [TAGS (tag_name type_name [COMMENT '...'] AS expr [, ...])]
+  [AS subquery]
+```
+
+### Trigger Types
+
+#### PERIOD (Scheduled Trigger)
+
+Fires at fixed system-time intervals. No trigger table required.
+
+```sql
+PERIOD(period_time [, offset_time])
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `period_time` | Scheduling interval. Range `[10a, 3650d]`. Units: `a` ms, `s` sec, `m` min, `h` hr, `d` day, `w` week, `n` month, `y` year. |
+| `offset_time` | Optional offset from midnight or epoch. |
+
+```sql
+-- Every hour
+CREATE STREAM hourly_summary PERIOD(1h)
+INTO summary_table
+AS SELECT CAST(_tlocaltime/1000000 AS TIMESTAMP), COUNT(*) FROM sensors;
+
+-- Every Monday at midnight
+CREATE STREAM weekly_report PERIOD(1w)
+FROM meters PARTITION BY location
+INTO weekly_table
+AS SELECT _wstart, location, AVG(current) FROM meters INTERVAL(1w) PARTITION BY location;
+```
+
+#### SLIDING Trigger
+
+Fires at fixed event-time intervals based on data written to the trigger table.
+
+```sql
+SLIDING(sliding_val [, offset_time])
+```
+
+Requires a `FROM` table.
+
+```sql
+CREATE STREAM sliding_avg
+  SLIDING(5m)
+  FROM meters PARTITION BY tbname
+INTO avg_table
+AS SELECT _twstart, avg(current) FROM %%tbname
+   WHERE _c0 >= _tprev_ts AND _c0 <= _tcurrent_ts;
+```
+
+#### INTERVAL (Time Window Trigger)
+
+Fires based on fixed-size event-time windows.
+
+```sql
+INTERVAL(interval_val [, interval_offset]) SLIDING(sliding_val)
+```
+
+```sql
+-- 5-minute windows, per subtable
+CREATE STREAM meter_5min
+  INTERVAL(5m) SLIDING(5m)
+  FROM meters PARTITION BY tbname
+  STREAM_OPTIONS(MAX_DELAY(1m) | FILL_HISTORY_FIRST)
+INTO meter_5min_table
+AS SELECT _twstart, AVG(current) FROM %%tbname
+   WHERE _c0 >= _twstart AND _c0 <= _twend;
+```
+
+#### SESSION Window Trigger
+
+Fires when session windows open or close.
+
+```sql
+SESSION(ts_col, session_val)
+```
+
+Records within `session_val` of each other belong to the same session.
+
+```sql
+CREATE STREAM session_analysis
+  SESSION(ts, 10m)
+  FROM device_events PARTITION BY tbname
+INTO session_table
+AS SELECT _twstart, _twend, COUNT(*) FROM %%trows;
+```
+
+#### STATE_WINDOW Trigger
+
+Fires when the value of a state column changes.
+
+```sql
+STATE_WINDOW(col [, extend [, zeroth_state]]) [TRUE_FOR(true_for_expr)]
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `col` | State column name. |
+| `extend` | `0` = default, `1` = extend end, `2` = extend start. |
+| `zeroth_state` | Value treated as "zero state" — windows with this value are not output. |
+
+```sql
+CREATE STREAM state_monitor
+  STATE_WINDOW(status)
+  FROM devices PARTITION BY tbname
+INTO status_log
+AS SELECT _twstart, _twend, status, COUNT(*) FROM %%trows;
+```
+
+With `TRUE_FOR` (minimum window duration/size filter):
+
+```sql
+-- Only windows lasting ≥ 10 minutes
+CREATE STREAM long_state_monitor
+  STATE_WINDOW(status) TRUE_FOR(10m)
+  FROM devices PARTITION BY tbname
+INTO long_status_table
+AS SELECT _twstart, _twend, COUNT(*) FROM %%trows;
+```
+
+#### EVENT_WINDOW Trigger
+
+Fires based on configurable start and end conditions.
+
+```sql
+EVENT_WINDOW(START WITH start_condition END WITH end_condition)
+  [TRUE_FOR(true_for_expr)]
+```
+
+```sql
+-- Alert when temperature stays above 80° for > 10 minutes
+CREATE STREAM temp_alert
+  EVENT_WINDOW(START WITH temp > 80 END WITH temp <= 80)
+  TRUE_FOR(10m)
+  FROM env_sensors PARTITION BY tbname
+  STREAM_OPTIONS(IGNORE_DISORDER)
+INTO temp_alerts
+AS SELECT _twstart, _twend, AVG(temp)
+   FROM env_sensors
+   WHERE ts >= _twstart AND ts <= _twend;
+```
+
+**Multiple start conditions** (sub-event windows, v3.3.7.0+):
+
+```sql
+EVENT_WINDOW(START WITH (cond1, cond2, ...) [END WITH end_cond])
+```
+
+#### COUNT_WINDOW Trigger
+
+Fires after a fixed number of rows are written.
+
+```sql
+COUNT_WINDOW(count_val [, sliding_val] [, col1, ...])
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `count_val` | Rows per window. Min `1`. |
+| `sliding_val` | Window slide count. |
+| `col1, ...` | Only count rows where at least one listed column is non-NULL. |
+
+```sql
+-- Compute avg after every 100 rows written
+CREATE STREAM batch_avg
+  COUNT_WINDOW(100)
+  FROM sensors PARTITION BY tbname
+INTO batch_table
+AS SELECT _twstart, AVG(value) FROM %%trows;
+```
+
+---
+
+## Trigger Grouping
+
+Use `PARTITION BY` to process each device/tag independently. Each group gets its own output subtable.
+
+```sql
+-- Per-subtable grouping
+PARTITION BY tbname
+
+-- Per-tag grouping
+PARTITION BY location
+
+-- No grouping (single output table)
+-- (omit PARTITION BY)
+```
+
+| Trigger Type | Supported Grouping |
+|-------------|-------------------|
+| `PERIOD`, `SLIDING`, `INTERVAL`, `SESSION` | Subtable, tag, or none |
+| `STATE_WINDOW`, `EVENT_WINDOW`, `COUNT_WINDOW` | Subtable only |
+
+---
+
+## STREAM_OPTIONS
+
+Control trigger and computation behavior:
+
+```sql
+STREAM_OPTIONS(option [| option | ...])
+```
+
+| Option | Description |
+|--------|-------------|
+| `WATERMARK(duration)` | Tolerance for out-of-order data. Data arriving later is treated as out-of-order. Default: `0`. |
+| `MAX_DELAY(delay_time)` | Maximum wait before forcibly triggering an unclosed window. Min `3s`. |
+| `EXPIRED_TIME(exp_time)` | Ignore data older than `latest_event_time - exp_time`. |
+| `IGNORE_DISORDER` | Ignore out-of-order data entirely (no recalculation). |
+| `DELETE_RECALC` | Trigger recomputation when data is deleted. |
+| `DELETE_OUTPUT_TABLE` | Delete output subtable when its source subtable is dropped. |
+| `FILL_HISTORY[(start_time)]` | Process historical data before real-time, starting from `start_time`. |
+| `FILL_HISTORY_FIRST[(start_time)]` | Process historical data first (before real-time). Cannot combine with `FILL_HISTORY`. |
+| `CALC_NOTIFY_ONLY` | Send results as notifications only; don't write to output table. |
+| `LOW_LATENCY_CALC` | Process immediately on each trigger. Higher resource usage. |
+| `PRE_FILTER(expr)` | Filter trigger table rows before trigger evaluation. |
+| `FORCE_OUTPUT` | Output a row with NULL values even when computation produces no result. |
+| `EVENT_TYPE(event_types)` | Specify trigger event types: `WINDOW_OPEN`, `WINDOW_CLOSE`, `IDLE`, `RESUME`. Default: `WINDOW_CLOSE`. |
+| `IGNORE_NODATA_TRIGGER` | Skip trigger if no data exists in the trigger window/interval. |
+| `IDLE_TIMEOUT(duration)` | Enable idle detection. Triggers `IDLE` event after no data for `duration`. Range: `[1s, 10d]`. |
+
+### WATERMARK
+
+Defines the tolerance window for late-arriving data. Only data and windows with event times earlier than `latest_event_time - WATERMARK` are eligible for triggering.
+
+```sql
+STREAM_OPTIONS(WATERMARK(10s))   -- tolerate up to 10 seconds of out-of-order data
+```
+
+### MAX_DELAY
+
+Forces a trigger after `delay_time` even if the window has not closed:
+
+```sql
+STREAM_OPTIONS(MAX_DELAY(1m))    -- force trigger after 1 minute if window is still open
+```
+
+### EVENT_TYPE
+
+```sql
+-- Trigger on both open and close
+STREAM_OPTIONS(EVENT_TYPE(WINDOW_OPEN | WINDOW_CLOSE))
+
+-- Trigger on idle/resume events
+STREAM_OPTIONS(EVENT_TYPE(IDLE | RESUME) | IDLE_TIMEOUT(5m))
+```
+
+---
+
+## Computation (AS subquery)
+
+The `AS subquery` clause defines what to compute when a trigger fires. It can query any table.
+
+**Placeholders available in subquery:**
+
+| Placeholder | Applies To | Description |
+|-------------|------------|-------------|
+| `_twstart` | Window triggers | Window start timestamp |
+| `_twend` | Window triggers | Window end timestamp |
+| `_twduration` | Window triggers | Window duration |
+| `_twrownum` | Window triggers | Row count in window |
+| `_tlocaltime` | All | Current trigger processing time (ns) |
+| `_tprev_localtime` | `PERIOD` | Previous trigger processing time (ns) |
+| `_tnext_localtime` | `PERIOD` | Next trigger processing time (ns) |
+| `_tprev_ts` | `SLIDING` | Previous trigger event time |
+| `_tcurrent_ts` | `SLIDING` | Current trigger event time |
+| `%%tbname` | Grouped by subtable | Reference to trigger group's table |
+| `%%trows` | `WINDOW_CLOSE` triggers | Dataset that triggered the current event |
+| `%%n` | Partitioned | Reference to nth `PARTITION BY` column |
+
+```sql
+-- Use %%tbname to query each device's own table
+AS SELECT _twstart, AVG(current)
+   FROM %%tbname
+   WHERE _c0 >= _twstart AND _c0 <= _twend;
+
+-- Use %%trows to compute on the triggering dataset
+AS SELECT avg(col1) FROM %%trows;
+
+-- Use _tlocaltime in PERIOD trigger (millisecond DB precision)
+AS SELECT CAST(_tlocaltime/1000000 AS TIMESTAMP), COUNT(*) FROM sensors;
+```
+
+---
+
+## Output Table
+
+```sql
+INTO [db_name.]table_name
+  [NODELAY_CREATE_SUBTABLE]
+  [OUTPUT_SUBTABLE(tbname_expr)]
+  [(col1, col2 [COMPOSITE KEY], ...)]
+  [TAGS (tag_name type AS expr, ...)]
+```
+
+- Supertable created automatically when `PARTITION BY` is used.
+- `NODELAY_CREATE_SUBTABLE` — create output subtables immediately at stream creation (default: created when first data is written).
+- `OUTPUT_SUBTABLE(expr)` — custom output subtable name per group.
+- `COMPOSITE KEY` on second column enables upsert behavior.
+
+---
+
+## Notification
+
+Send event notifications over WebSocket:
+
+```sql
+NOTIFY(url [, url2, ...])
+  [ON (event_types)]
+  [WHERE condition]
+  [NOTIFY_OPTIONS(NOTIFY_HISTORY | ON_FAILURE_PAUSE)]
+```
+
+| Option | Description |
+|--------|-------------|
+| `ON (event_types)` | Events to notify: `WINDOW_OPEN`, `WINDOW_CLOSE`, `ON_TIME`, `IDLE`, `RESUME`. |
+| `WHERE condition` | Only notify when condition is met (references result columns). |
+| `NOTIFY_HISTORY` | Send notifications during historical computation. Default: off. |
+| `ON_FAILURE_PAUSE` | Pause stream on delivery failure, retry until success. Default: drop notification. |
+
+```sql
+CREATE STREAM avg_stream
+  INTERVAL(1m) SLIDING(1m)
+  FROM meters PARTITION BY tbname
+  NOTIFY('ws://localhost:8080/notify') ON (WINDOW_OPEN, WINDOW_CLOSE)
+    NOTIFY_OPTIONS(NOTIFY_HISTORY)
+INTO avg_stb
+AS SELECT _twstart, _twend, AVG(current) FROM %%trows;
+```
+
+Notification messages are JSON:
+
+```json
+{
+  "messageId": "unique-id",
+  "timestamp": 1733284887203,
+  "streams": [{
+    "streamName": "avg_stream",
+    "events": [{
+      "eventType": "WINDOW_CLOSE",
+      "triggerType": "Interval",
+      "windowStart": 1733284800000,
+      "windowEnd": 1733284860000,
+      "result": { "_wstart": 1733284800000, "avg(current)": 1.3 }
+    }]
+  }]
+}
+```
+
+---
+
+## Stream Management
+
+### Drop a Stream
+
+```sql
+DROP STREAM [IF EXISTS] [db_name.]stream_name [, stream_name2, ...];
+```
+
+Data written by the stream is **not** deleted.
+
+### Start / Stop a Stream
+
+```sql
+START STREAM [IF EXISTS] [IGNORE UNTREATED] [db_name.]stream_name;
+STOP STREAM  [IF EXISTS] [db_name.]stream_name;
+```
+
+- Streams start automatically after creation.
+- Stopping a stream is persistent; it does not resume until explicitly restarted.
+- When restarted, data written during the stopped period is treated as historical data.
+
+### Manual Recalculation
+
+```sql
+RECALCULATE STREAM [db_name.]stream_name FROM start_time [TO end_time];
+```
+
+Re-triggers computation for the specified event-time range. Useful after out-of-order writes, updates, or deletions.
+
+### View Streams
+
+```sql
+-- List all streams
+SHOW STREAMS;
+SHOW db_name.STREAMS;
+
+-- Detailed stream info
+SELECT * FROM information_schema.ins_streams;
+
+-- Stream task details
+SELECT * FROM information_schema.ins_stream_tasks;
+```
+
+---
+
+## Examples
+
+### Scheduled energy summary per device (daily)
+
+```sql
+CREATE STREAM daily_energy
+  PERIOD(1d)
+  FROM meters PARTITION BY tbname, groupid, location
+INTO energy_daily (ts, total_kwh)
+  TAGS (groupid INT AS groupid, location VARCHAR(24) AS location)
+AS
+  SELECT CAST(_tlocaltime/1000000 AS TIMESTAMP),
+         SUM(current * voltage) AS total_kwh
+  FROM meters
+  WHERE ts >= CAST(_tprev_localtime/1000000 AS TIMESTAMP)
+    AND ts <= CAST(_tlocaltime/1000000 AS TIMESTAMP);
+```
+
+### Sliding window with max delay
+
+```sql
+CREATE STREAM meter_5min
+  INTERVAL(5m) SLIDING(5m)
+  FROM meters PARTITION BY tbname
+  STREAM_OPTIONS(MAX_DELAY(1m) | FILL_HISTORY_FIRST)
+INTO meter_5min_agg
+AS SELECT _twstart, AVG(current), MAX(voltage)
+   FROM %%tbname
+   WHERE _c0 >= _twstart AND _c0 <= _twend;
+```
+
+### Event-driven alert with notification
+
+```sql
+CREATE STREAM overvoltage_alert
+  EVENT_WINDOW(START WITH voltage > 250 END WITH voltage <= 250)
+  TRUE_FOR(5m)
+  FROM meters PARTITION BY tbname
+  STREAM_OPTIONS(WATERMARK(30s))
+  NOTIFY('ws://alerts.example.com:8080/voltage') ON (WINDOW_CLOSE)
+INTO voltage_incidents
+AS SELECT _twstart AS incident_start, _twend AS incident_end,
+          MAX(voltage) AS peak_voltage
+   FROM %%tbname
+   WHERE ts >= _twstart AND ts <= _twend;
+```

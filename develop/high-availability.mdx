@@ -1,0 +1,264 @@
+---
+title: "High-Performance Ingestion"
+description: "Build high-throughput data ingestion pipelines in TDengine using the connector's efficient writing feature, connection pools, and multi-threaded patterns."
+---
+
+TDengine connectors provide a high-performance write feature that automatically manages write threads, per-subtable queues, and batch flushing. When enabled, this feature lets a single-threaded application layer achieve throughput comparable to a hand-tuned multi-threaded writer, without requiring knowledge of thread management or data sharding.
+
+## How the efficient writing feature works
+
+When efficient writing is enabled, the connector:
+
+1. Creates a pool of background write threads and a dedicated queue per subtable.
+2. Accepts data through the standard parameter-binding interface (`addBatch` / `executeBatch` in Java).
+3. Automatically shards data by subtable and buffers it in the corresponding queue.
+4. Flushes a batch when either the queue size threshold is reached or a timeout expires.
+
+This approach reduces network round trips and increases throughput without changing the application's interface.
+
+<Note>
+The connector's efficient writing feature only supports writing to supertables, not ordinary tables.
+</Note>
+
+## Enabling efficient writing (Java / JDBC)
+
+The JDBC efficient writing feature is available from driver version `3.6.0` over WebSocket connections.
+
+You can enable it in two ways:
+
+**Via connection property:**
+
+```java
+props.setProperty("asyncWrite", "stmt");
+// or use the constant:
+props.setProperty(TSDBDriver.PROPERTY_KEY_ASYNC_WRITE, "stmt");
+```
+
+**Via SQL prefix in the prepared statement:**
+
+```java
+// Use ASYNC_INSERT INTO instead of INSERT INTO
+PreparedStatement pstmt = conn.prepareStatement(
+    "ASYNC_INSERT INTO ? USING meters TAGS(?,?) VALUES (?,?,?,?)"
+);
+```
+
+### Key configuration parameters
+
+| Property constant                              | Default | Description                                        |
+| ---------------------------------------------- | ------- | -------------------------------------------------- |
+| `PROPERTY_KEY_BACKEND_WRITE_THREAD_NUM`        | `10`    | Number of background write threads                 |
+| `PROPERTY_KEY_BATCH_SIZE_BY_ROW`               | `1000`  | Rows per flush batch                               |
+| `PROPERTY_KEY_CACHE_SIZE_BY_ROW`               | `10000` | Maximum rows buffered in the queue                 |
+| `PROPERTY_KEY_ENABLE_AUTO_RECONNECT`           | `false` | Reconnect automatically after connection loss      |
+| `PROPERTY_KEY_RECONNECT_INTERVAL_MS`           | `2000`  | Reconnect retry interval in milliseconds           |
+| `PROPERTY_KEY_RECONNECT_RETRY_COUNT`           | `3`     | Number of reconnect attempts                       |
+
+<Tip>
+Enable `PROPERTY_KEY_ENABLE_AUTO_RECONNECT` in production ingestion pipelines. A disconnected write thread silently drops data unless auto-reconnect is configured.
+</Tip>
+
+### Checking write results
+
+In efficient writing mode, call `executeUpdate()` to synchronously confirm how many rows were written. If a write fails, `executeUpdate()` throws an exception:
+
+```java
+// addBatch queues one row
+pstmt.addBatch();
+
+// executeBatch submits the batch to the background queue
+pstmt.executeBatch();
+
+// executeUpdate blocks until writes are confirmed and returns row count
+int written = pstmt.executeUpdate();
+```
+
+### JDBC efficient writing example
+
+```java
+import java.sql.*;
+import java.util.Properties;
+import com.taosdata.jdbc.TSDBDriver;
+
+public class WSHighVolumeDemo {
+    public static void main(String[] args) throws Exception {
+        Properties props = new Properties();
+        props.setProperty(TSDBDriver.PROPERTY_KEY_ASYNC_WRITE, "stmt");
+        props.setProperty(TSDBDriver.PROPERTY_KEY_BACKEND_WRITE_THREAD_NUM, "10");
+        props.setProperty(TSDBDriver.PROPERTY_KEY_BATCH_SIZE_BY_ROW, "1000");
+        props.setProperty(TSDBDriver.PROPERTY_KEY_CACHE_SIZE_BY_ROW, "10000");
+        props.setProperty(TSDBDriver.PROPERTY_KEY_ENABLE_AUTO_RECONNECT, "true");
+        props.setProperty(TSDBDriver.PROPERTY_KEY_RECONNECT_INTERVAL_MS, "2000");
+        props.setProperty(TSDBDriver.PROPERTY_KEY_RECONNECT_RETRY_COUNT, "3");
+
+        String url = "jdbc:TAOS-WS://localhost:6041/power?user=root&password=taosdata";
+
+        try (Connection conn = DriverManager.getConnection(url, props)) {
+            // Enable efficient writing for this connection
+            String sql = "INSERT INTO ? USING meters TAGS(?,?) VALUES (?,?,?,?)";
+            try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
+                for (int i = 0; i < 1000; i++) {
+                    pstmt.setString(1, "d" + (i % 100));        // subtable name
+                    pstmt.setInt(2, i % 10);                     // tag: groupId
+                    pstmt.setString(3, "California.SFO");        // tag: location
+                    pstmt.setTimestamp(4, new Timestamp(System.currentTimeMillis() + i));
+                    pstmt.setFloat(5, (float)(Math.random() * 30));
+                    pstmt.setInt(6, (int)(Math.random() * 300));
+                    pstmt.setFloat(7, (float) Math.random());
+                    pstmt.addBatch();
+                }
+                pstmt.executeBatch();
+                int written = pstmt.executeUpdate();
+                System.out.println("Rows written: " + written);
+            }
+        }
+    }
+}
+```
+
+## Key factors for write performance
+
+### Application-level factors
+
+<Steps>
+  <Step title="Use batch writes">
+    Include as many rows as possible in each SQL statement or parameter binding batch. Larger batches reduce per-row overhead. Performance gains diminish beyond a certain batch size — tune through testing for your environment.
+  </Step>
+  <Step title="Use multiple write threads">
+    Increasing the number of write threads improves throughput until a system resource bottleneck is reached. Assign each thread an independent connection to reduce contention.
+  </Step>
+  <Step title="Maximize write locality">
+    Write rows belonging to the same subtable in each batch. Writing to a single subtable per batch is more efficient than scattering writes across many subtables in one call.
+  </Step>
+  <Step title="Pre-create subtables">
+    Pre-creating subtables eliminates the per-write check for table existence and allows you to omit tag columns during insertion, reducing overhead on each write.
+  </Step>
+  <Step title="Choose the most efficient write method">
+    In descending order of throughput:
+    1. Parameter binding (STMT2) — no SQL parsing, no auto-create overhead
+    2. Raw SQL without auto table creation
+    3. Raw SQL with auto table creation (`INSERT INTO ... USING ...`)
+    4. Schemaless ingestion — slowest due to dynamic schema checks
+  </Step>
+  <Step title="Maintain timestamp order">
+    Submit rows for each subtable in ascending timestamp order. Out-of-order data triggers additional server-side sorting and reduces write throughput.
+  </Step>
+  <Step title="Enable compression">
+    When network bandwidth is limited or data has high repetition, enable WebSocket compression:
+
+    ```java
+    // Java JDBC
+    props.setProperty("enableCompression", "true");
+    ```
+
+    ```go
+    // Go DSN
+    "root:taosdata@ws(localhost:6041)/testdb?enableCompression=true"
+    ```
+  </Step>
+</Steps>
+
+### Multi-source queue architecture
+
+When the application reads from multiple data sources, add a queue between readers and writers:
+
+| Scenario                                                                   | Queue role                                          |
+| -------------------------------------------------------------------------- | --------------------------------------------------- |
+| Many sources, each slow; large aggregate volume                            | Aggregate data from multiple sources before writing |
+| A single source is faster than a single write thread                       | Fan out to multiple write threads                   |
+| Data for one table arrives from multiple sources                           | Consolidate rows per subtable before writing        |
+
+When using Kafka as the data source:
+
+- Write data for the same subtable to the same Topic and Partition (maximizes data locality).
+- Increase the Consumer thread count to increase write concurrency.
+- Increase `max.poll.records` to fetch more rows per poll cycle.
+
+### Server-level configuration
+
+| Parameter      | Recommendation                                                                                                        |
+| -------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `vgroups`      | Set based on disk count, I/O capacity, and CPU cores. Aim for fewer than 1 million tables per vgroup.                |
+| `buffer`       | Default is 256 MB per vnode. Increase to allow larger in-memory batches before flushing to disk.                     |
+| `cachemodel`   | Disable or reduce to `last_row` if last-row caching is not required. `both` (default) updates caches on every write. |
+| `stt_trigger`  | Use `1` for high-frequency writes to few tables; use `> 1` for many tables with sparse writes.                       |
+| `compressMsgSize` | Enable RPC message compression when bandwidth is a bottleneck.                                                    |
+| `numOfCommitThreads` | Increase on servers with multiple disks to utilize concurrent I/O. Default is 4.                             |
+
+## Multi-endpoint connection failover
+
+For production deployments, configure multiple taosAdapter endpoints to avoid a single point of failure.
+
+<CodeGroup>
+
+```go Go DSN multi-endpoint
+// taosWS supports automatic failover across multiple endpoints
+var taosDSN = "root:taosdata@ws(adapter-a:6041,adapter-b:6041)/testdb"
+taos, err := sql.Open("taosWS", taosDSN)
+```
+
+```java Java JDBC URL
+// JDBC WebSocket with multiple endpoints is supported via taosAdapter load balancing
+String url = "jdbc:TAOS-WS://adapter-a:6041/power?user=root&password=taosdata";
+// For failover, deploy taosAdapter behind a load balancer or use the C# multi-host syntax
+```
+
+```csharp C# multi-endpoint
+using var client = DbDriver.Open(new ConnectionStringBuilder(
+    "protocol=WebSocket;" +
+    "host=adapter-a:6041,adapter-b:6041;" +
+    "username=root;" +
+    "password=taosdata;" +
+    "autoReconnect=true;" +
+    "reconnectRetryCount=3;" +
+    "reconnectIntervalMs=2000;"));
+```
+
+</CodeGroup>
+
+<Warning>
+When using Go's `ws/unified` interface (`autoReconnect=true`), the current database context is lost after a reconnect. Always specify the database in the DSN and avoid calling `USE dbname` on a shared connection.
+</Warning>
+
+## Connection pool configuration
+
+Use a connection pool in production to avoid the overhead of creating and destroying connections on every write.
+
+```java
+// Java HikariCP with efficient writing enabled
+HikariConfig config = new HikariConfig();
+config.setJdbcUrl(
+    "jdbc:TAOS-WS://localhost:6041/power?user=root&password=taosdata&asyncWrite=stmt"
+);
+config.setMaximumPoolSize(20);
+config.setMinimumIdle(5);
+config.setConnectionTimeout(30_000);
+config.setIdleTimeout(600_000);
+config.setMaxLifetime(1_800_000);
+HikariDataSource dataSource = new HikariDataSource(config);
+```
+
+## High-volume write benchmark
+
+The following benchmark was measured on a 40-core CPU, 256 GB RAM, SSD server using the Java JDBC efficient writing feature with 2 reader threads and 10 write threads per reader:
+
+```text
+java -jar highVolume.jar -r 2 -w 10 -b 10000 -c 100000 -s 1000000 -R 100
+
+[INFO] numberOfTable=1000000 count=12235906  speed=1,223,590 rows/s
+[INFO] numberOfTable=1000000 count=31185614  speed=1,894,970 rows/s
+[INFO] numberOfTable=1000000 count=51464904  speed=2,027,929 rows/s
+[INFO] numberOfTable=1000000 count=71498113  speed=2,003,320 rows/s
+[INFO] numberOfTable=1000000 count=91242103  speed=1,974,399 rows/s
+```
+
+Key parameters in this benchmark:
+
+| Flag | Value   | Meaning                                      |
+| ---- | ------- | -------------------------------------------- |
+| `-r` | `2`     | Reader/worker threads                        |
+| `-w` | `10`    | Write threads per reader                     |
+| `-b` | `10000` | Batch size in rows (`batchSizeByRow`)        |
+| `-c` | `100000`| Cache size in rows (`cacheSizeByRow`)        |
+| `-s` | `1000000`| Total number of subtables                  |
+| `-R` | `100`   | Rows per subtable                            |

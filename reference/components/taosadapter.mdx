@@ -1,0 +1,309 @@
+---
+title: "taosAdapter"
+description: "Reference for taosAdapter, the HTTP adapter that bridges REST clients, language connectors, and third-party agents with TDengine. Covers startup, REST API endpoints, configuration options, and integrations."
+---
+
+taosAdapter is a companion component for TDengine that acts as a bridge between the TDengine cluster and applications. Language connectors (Python, Go, Node.js, Rust, etc.) communicate with TDengine through taosAdapter's WebSocket interface, so taosAdapter must be running whenever you use a connector.
+
+taosAdapter also provides:
+- A REST API for HTTP-based SQL execution
+- InfluxDB v1 line protocol write endpoint
+- OpenTSDB JSON and telnet write endpoints
+- Prometheus remote_read and remote_write endpoints
+- Native ingestion from Telegraf, collectd, StatsD, icinga2, and TCollector
+- OpenMetrics and node_exporter scraping
+- JSON data ingestion via configurable rules
+
+## Installation
+
+taosAdapter is bundled with the TDengine server package. After installing TDengine, taosAdapter is ready to use. To build from source, see the [taosAdapter build guide](https://github.com/taosdata/taosadapter/blob/3.0/BUILD.md).
+
+## Starting taosAdapter
+
+```bash
+# Start
+systemctl start taosadapter
+
+# Stop
+systemctl stop taosadapter
+
+# Restart
+systemctl restart taosadapter
+
+# Check status
+systemctl status taosadapter
+```
+
+<Note>
+`systemctl` commands require root privileges. Add `sudo` if you are not the root user.
+</Note>
+
+## REST API
+
+The REST API is available at `http://<host>:6041/rest/sql`. Submit SQL statements as the request body using POST. Authentication is via HTTP Basic Auth or query parameters.
+
+```bash
+curl -u root:taosdata \
+  -d "SELECT server_version()" \
+  http://localhost:6041/rest/sql
+```
+
+### InfluxDB line protocol
+
+Write data in InfluxDB v1 line protocol format:
+
+```text
+POST http://<host>:6041/influxdb/v1/write?db=<database>
+```
+
+Query parameters:
+
+| Parameter | Description |
+|-----------|-------------|
+| `db` | Target TDengine database |
+| `precision` | Timestamp precision (`ms`, `us`, `ns`) |
+| `u` | TDengine username |
+| `p` | TDengine password |
+| `ttl` | TTL for auto-created subtables |
+| `table_name_key` | Tag key to use as the subtable name |
+
+Example:
+
+```bash
+curl --request POST \
+  "http://127.0.0.1:6041/influxdb/v1/write?db=test" \
+  --user "root:taosdata" \
+  --data-binary "measurement,host=host1 field1=2i,field2=2.0 1577836800000000000"
+```
+
+<Note>
+InfluxDB token authentication is not supported. Use Basic Auth or query parameters (`u` and `p`).
+</Note>
+
+### OpenTSDB endpoints
+
+```text
+POST http://<host>:6041/opentsdb/v1/put/json/<db>
+POST http://<host>:6041/opentsdb/v1/put/telnet/<db>
+```
+
+### Health check
+
+```bash
+curl http://localhost:6041/-/ping
+```
+
+Returns HTTP 200 when healthy. Returns 503 if memory thresholds are exceeded.
+
+## Configuration
+
+The default configuration file is `/etc/taos/taosadapter.toml`. You can specify an alternate path with `-c` or `--config`. Command-line parameters override environment variables, which override the configuration file.
+
+See the [full example config](https://github.com/taosdata/taosadapter/blob/3.0/example/config/taosadapter.toml).
+
+### Basic configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `port` | `6041` | HTTP/WebSocket service port |
+| `debug` | `true` | Enable Go pprof debug endpoint at `/debug/pprof` |
+| `instanceId` | `32` | Instance ID for distinguishing logs from multiple instances |
+| `taosConfigDir` | `/etc/taos` | TDengine configuration directory (`taos.cfg` is loaded from here) |
+| `maxAsyncConcurrentLimit` | CPU cores | Max concurrent calls for async C methods |
+| `maxSyncConcurrentLimit` | CPU cores | Max concurrent calls for sync C methods |
+
+### Log configuration
+
+```toml
+[log]
+path = "/var/log/taos"
+level = "info"
+keepDays = 30
+rotationCount = 30
+rotationSize = "1GB"
+compress = false
+reservedDiskSize = "1GB"
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `log.path` | `/var/log/taos` | Log directory |
+| `log.level` | `info` | Log level: `panic`, `fatal`, `error`, `warn`, `info`, `debug`, `trace` |
+| `log.keepDays` | `30` | Log retention in days |
+| `log.rotationCount` | `30` | Number of rotated log files to keep |
+| `log.rotationSize` | `1GB` | Max size of a single log file |
+| `log.compress` | `false` | Compress old log files |
+
+### Connection pool
+
+```toml
+[pool]
+maxConnect = 0       # default: 2× CPU cores
+maxIdle = 0          # default: same as maxConnect
+waitTimeout = 60     # seconds
+maxWait = 0          # 0 = unlimited
+```
+
+### Memory limits
+
+taosAdapter automatically pauses request processing when system memory is under pressure:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `monitor.pauseQueryMemoryThreshold` | `70` | Pause queries when memory usage exceeds this percentage |
+| `monitor.pauseAllMemoryThreshold` | `80` | Pause all requests when memory usage exceeds this percentage |
+
+When the `pauseAllMemoryThreshold` is exceeded, `/-/ping` returns 503.
+
+### CORS
+
+```toml
+[cors]
+allowAllOrigins = true
+allowCredentials = false
+allowWebSockets = true
+```
+
+### Prometheus integration
+
+Enable Prometheus remote_read and remote_write:
+
+```toml
+[prometheus]
+enable = true
+```
+
+Configure your Prometheus `scrape_configs` to scrape from taosAdapter via taosKeeper (see [taosKeeper](/reference/components/taoskeeper)).
+
+### Telegraf integration (InfluxDB output plugin)
+
+Configure the Telegraf `outputs.http` plugin to write to taosAdapter's InfluxDB endpoint:
+
+```toml
+[[outputs.http]]
+  url = "http://127.0.0.1:6041/influxdb/v1/write?db=telegraf"
+  method = "POST"
+  timeout = "5s"
+  username = "root"
+  password = "taosdata"
+  data_format = "influx"
+```
+
+Also enable InfluxDB protocol support and auto-create DB in `taosadapter.toml`:
+
+```toml
+smlAutoCreateDB = true
+
+[influxdb]
+enable = true
+```
+
+### OpenMetrics scraping
+
+Starting from version 3.3.7.0, taosAdapter can scrape OpenMetrics/Prometheus-format endpoints (such as node_exporter):
+
+```toml
+[open_metrics]
+enable = true
+user = "root"
+password = "taosdata"
+urls = ["http://localhost:9100"]
+dbs = ["open_metrics"]
+gatherDurationSeconds = [5]
+responseTimeoutSeconds = [5]
+```
+
+### JSON data ingestion
+
+Available from version 3.4.0.0, the JSON ingestion endpoint accepts POST requests at:
+
+```text
+POST http://<host>:6041/input_json/v1/{endpoint}
+```
+
+Configure rules in `taosadapter.toml`:
+
+```toml
+[input_json]
+enable = true
+
+[[input_json.rules]]
+endpoint = "rule1"
+dbKey = "db"
+superTableKey = "stb"
+subTableKey = "table"
+timeKey = "time"
+timeFormat = "datetime"
+timezone = "UTC"
+fields = [
+  {key = "current", optional = false},
+  {key = "voltage", optional = false},
+  {key = "phase", optional = false},
+]
+```
+
+Add `?dry_run=true` to validate the configuration without writing data.
+
+### Query concurrency limits
+
+From version 3.3.6.29/3.3.8.3, you can cap concurrent queries to protect the system under high load:
+
+```toml
+[request]
+queryLimitEnable = true
+excludeQueryLimitSql = ["select 1", "select server_version()"]
+
+[request.default]
+queryLimit = 200
+queryWaitTimeout = 900
+queryMaxWait = 0
+
+[request.users.root]
+queryLimit = 100
+queryWaitTimeout = 200
+queryMaxWait = 10
+```
+
+Requests that exceed the limit return HTTP 503 (REST) or error code `0xFFFE` (WebSocket).
+
+### Metrics reporting to taosKeeper
+
+```toml
+[uploadKeeper]
+enable = true
+url = "http://127.0.0.1:6043/adapter_report"
+interval = "15s"
+timeout = "5s"
+retryTimes = 3
+retryInterval = "5s"
+```
+
+### collectd
+
+```toml
+[collectd]
+enable = false
+port = 6045
+db = "collectd"
+user = "root"
+password = "taosdata"
+```
+
+### StatsD
+
+```toml
+[statsd]
+enable = false
+port = 6044
+protocol = "udp4"
+db = "statsd"
+```
+
+### OpenTSDB Telnet
+
+```toml
+[opentsdb_telnet]
+enable = false
+ports = [6046, 6047, 6048, 6049]
+dbs = ["opentsdb_telnet", "collectd_tsdb", "icinga2_tsdb", "tcollector_tsdb"]
+```

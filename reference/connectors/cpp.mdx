@@ -1,0 +1,639 @@
+---
+title: "C/C++ Client Library"
+description: "Reference for the TDengine C/C++ client library: connecting, querying, parameter binding, schemaless insert, async queries, and TMQ data subscription."
+---
+
+The TDengine C/C++ client library is provided as a dynamic library (`libtaos`). It exposes a C API that supports both WebSocket and native connections, synchronous and asynchronous queries, the STMT2 parameter binding API, schemaless insert, and TMQ data subscription.
+
+## Installation
+
+After installing the TDengine server or client package, the following files are available:
+
+| File | Linux | Windows | macOS |
+|---|---|---|---|
+| Header | `/usr/local/taos/include/taos.h` | `C:\TDengine\include\taos.h` | `/usr/local/include/taos.h` |
+| Library | `/usr/local/taos/driver/libtaos.so` | `C:\TDengine\driver\taos.dll` | `/usr/local/lib/libtaos.dylib` |
+
+Include the header and link against the library when building:
+
+```c
+#include "taos.h"
+```
+
+```bash
+gcc -o myapp myapp.c -ltaos
+```
+
+## Connection modes
+
+The library supports two connection modes. Call `taos_options()` **once at program startup** to select the mode before calling any other API.
+
+<Tabs>
+  <Tab title="WebSocket (recommended)">
+    WebSocket connects through `taosAdapter` on port 6041. Server and client versions do not need to match exactly.
+
+    ```c
+    #include <stdio.h>
+    #include "taos.h"
+
+    int main() {
+        // Must be called once, before taos_connect()
+        taos_options(TSDB_OPTION_DRIVER, "websocket");
+
+        TAOS *taos = taos_connect("localhost", "root", "taosdata", NULL, 6041);
+        if (taos == NULL) {
+            fprintf(stderr, "Connect failed: %s\n", taos_errstr(NULL));
+            return -1;
+        }
+
+        printf("Connected to TDengine via WebSocket\n");
+        taos_close(taos);
+        taos_cleanup();
+        return 0;
+    }
+    ```
+  </Tab>
+  <Tab title="Native">
+    Native connects directly to `taosd` on port 6030. The client and server version must match.
+
+    ```c
+    #include <stdio.h>
+    #include "taos.h"
+
+    int main() {
+        // No taos_options call needed — native is the default
+        TAOS *taos = taos_connect("localhost", "root", "taosdata", NULL, 6030);
+        if (taos == NULL) {
+            fprintf(stderr, "Connect failed: %s\n", taos_errstr(NULL));
+            return -1;
+        }
+
+        printf("Connected to TDengine via native connection\n");
+        taos_close(taos);
+        taos_cleanup();
+        return 0;
+    }
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+`taos_options(TSDB_OPTION_DRIVER, ...)` must be called **at the beginning of the program** and **only once**. Once set, the driver mode is fixed for the entire process lifetime and cannot be changed.
+</Warning>
+
+## Basic API
+
+### taos_connect
+
+```c
+TAOS *taos_connect(const char *ip, const char *user, const char *pass,
+                   const char *db, uint16_t port);
+```
+
+Establishes a database connection. Returns a `TAOS*` handle on success, or `NULL` on failure.
+
+| Parameter | Description |
+|---|---|
+| `ip` | FQDN or IP address of any node in the TDengine cluster |
+| `user` | Username |
+| `pass` | Password |
+| `db` | Database name (optional; pass `NULL` to connect without selecting a database) |
+| `port` | Port number (`6041` for WebSocket, `6030` for native) |
+
+### taos_close
+
+```c
+void taos_close(TAOS *taos);
+```
+
+Closes the connection and releases associated resources. Call this when your application is done with the connection.
+
+### taos_cleanup
+
+```c
+void taos_cleanup(void);
+```
+
+Cleans up the runtime environment. Call this once before the application exits.
+
+### taos_get_server_info
+
+```c
+char *taos_get_server_info(TAOS *taos);
+```
+
+Returns the server version string.
+
+### taos_get_client_info
+
+```c
+char *taos_get_client_info(void);
+```
+
+Returns the client version string.
+
+## Synchronous queries
+
+### taos_query
+
+```c
+TAOS_RES *taos_query(TAOS *taos, const char *sql);
+```
+
+Executes an SQL statement. Works for DQL, DML, and DDL statements. **Do not check the return value for `NULL`**—always call `taos_errno()` to check for errors:
+
+```c
+TAOS_RES *result = taos_query(taos, "SELECT ts, current FROM power.meters LIMIT 10");
+if (taos_errno(result) != 0) {
+    fprintf(stderr, "Query failed: %s\n", taos_errstr(result));
+    taos_free_result(result);
+    return -1;
+}
+```
+
+### taos_fetch_row
+
+```c
+TAOS_ROW taos_fetch_row(TAOS_RES *res);
+```
+
+Fetches the next row from the result set. Returns `NULL` when there are no more rows.
+
+### taos_fetch_fields
+
+```c
+TAOS_FIELD *taos_fetch_fields(TAOS_RES *res);
+```
+
+Returns an array of `TAOS_FIELD` structures describing each column in the result set. Each `TAOS_FIELD` has:
+- `name[65]` — column name
+- `type` — data type (e.g., `TSDB_DATA_TYPE_TIMESTAMP`, `TSDB_DATA_TYPE_FLOAT`)
+- `bytes` — column width in bytes
+
+### taos_field_count / taos_num_fields
+
+```c
+int taos_field_count(TAOS_RES *res);
+int taos_num_fields(TAOS_RES *res);
+```
+
+Both functions return the number of columns in the result set.
+
+### taos_affected_rows
+
+```c
+int taos_affected_rows(TAOS_RES *res);
+```
+
+Returns the number of rows affected by the last INSERT, UPDATE, or DELETE statement.
+
+### taos_free_result
+
+```c
+void taos_free_result(TAOS_RES *res);
+```
+
+Frees the result set and all associated memory. Always call this after you are done with a result set to avoid memory leaks.
+
+### Complete query example
+
+```c
+// to compile: gcc -o query_data_demo query_data_demo.c -ltaos
+
+#include <stdio.h>
+#include <stdlib.h>
+#include "taos.h"
+
+int main() {
+    taos_options(TSDB_OPTION_DRIVER, "websocket");
+
+    TAOS *taos = taos_connect("localhost", "root", "taosdata", NULL, 6041);
+    if (taos == NULL) {
+        fprintf(stderr, "Connect failed: ErrCode: 0x%x, ErrMessage: %s\n",
+                taos_errno(NULL), taos_errstr(NULL));
+        taos_cleanup();
+        return -1;
+    }
+
+    const char *sql = "SELECT ts, current, location FROM power.meters LIMIT 100";
+    TAOS_RES   *result = taos_query(taos, sql);
+    if (taos_errno(result) != 0) {
+        fprintf(stderr, "Query failed: ErrCode: 0x%x, ErrMessage: %s\n",
+                taos_errno(result), taos_errstr(result));
+        taos_free_result(result);
+        taos_close(taos);
+        taos_cleanup();
+        return -1;
+    }
+
+    int         num_fields = taos_num_fields(result);
+    TAOS_FIELD *fields     = taos_fetch_fields(result);
+    TAOS_ROW    row;
+    int         rows = 0;
+    char        buf[1024];
+
+    printf("Query returned %d columns\n", num_fields);
+
+    while ((row = taos_fetch_row(result)) != NULL) {
+        rows++;
+        taos_print_row(buf, row, fields, num_fields);
+        printf("row %d: %s\n", rows, buf);
+    }
+
+    printf("Total rows: %d\n", rows);
+    taos_free_result(result);
+
+    taos_close(taos);
+    taos_cleanup();
+    return 0;
+}
+```
+
+## Error handling
+
+### taos_errno
+
+```c
+int taos_errno(TAOS_RES *res);
+```
+
+Returns the error code of the last operation. `0` means success; non-zero is a failure. Pass `NULL` to get the error code when no result set is available.
+
+### taos_errstr
+
+```c
+char *taos_errstr(TAOS_RES *res);
+```
+
+Returns a human-readable error message for the last operation. Pass `NULL` when no result set is available.
+
+```c
+TAOS_RES *res = taos_query(taos, "SELECT * FROM nonexistent_table");
+if (taos_errno(res) != 0) {
+    fprintf(stderr, "Error code: 0x%x, Message: %s\n",
+            taos_errno(res), taos_errstr(res));
+    taos_free_result(res);
+}
+```
+
+## STMT2 parameter binding
+
+The STMT2 API lets you prepare an INSERT statement once and execute it with batches of bound data across multiple subtables. This avoids repeated SQL parsing overhead and significantly improves write throughput.
+
+**Typical workflow:**
+
+<Steps>
+  <Step title="Initialize">
+    Call `taos_stmt2_init()` to create a statement object.
+  </Step>
+  <Step title="Prepare">
+    Call `taos_stmt2_prepare()` with your INSERT template.
+  </Step>
+  <Step title="Bind">
+    Call `taos_stmt2_bind_param()` to bind table names, tags, and column values.
+  </Step>
+  <Step title="Execute">
+    Call `taos_stmt2_exec()` to submit the batch.
+  </Step>
+  <Step title="Close">
+    Call `taos_stmt2_close()` to release all resources.
+  </Step>
+</Steps>
+
+### Key STMT2 functions
+
+```c
+TAOS_STMT2 *taos_stmt2_init(TAOS *taos, TAOS_STMT2_OPTION *option);
+int         taos_stmt2_prepare(TAOS_STMT2 *stmt, const char *sql, unsigned long length);
+int         taos_stmt2_bind_param(TAOS_STMT2 *stmt, TAOS_STMT2_BINDV *bindv, int32_t col_idx);
+int         taos_stmt2_exec(TAOS_STMT2 *stmt, int *affected_rows);
+int         taos_stmt2_close(TAOS_STMT2 *stmt);
+char       *taos_stmt2_error(TAOS_STMT2 *stmt);
+```
+
+The `TAOS_STMT2_BINDV` structure carries the data to bind:
+
+```c
+typedef struct {
+    int              count;      // number of subtables
+    char           **tbnames;    // subtable names
+    TAOS_STMT2_BIND **tags;      // tag values per subtable
+    TAOS_STMT2_BIND **bind_cols; // column values per subtable
+} TAOS_STMT2_BINDV;
+```
+
+### STMT2 example
+
+```c
+// to compile: gcc -o stmt2_insert_demo stmt2_insert_demo.c -ltaos
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/time.h>
+#include "taos.h"
+
+#define NUM_TABLES 3
+#define NUM_ROWS   5
+
+int main() {
+    taos_options(TSDB_OPTION_DRIVER, "websocket");
+
+    TAOS *taos = taos_connect("localhost", "root", "taosdata", NULL, 6041);
+    if (taos == NULL) {
+        fprintf(stderr, "Connect failed: %s\n", taos_errstr(NULL));
+        taos_cleanup();
+        return -1;
+    }
+
+    // Create database and supertable
+    TAOS_RES *res;
+    res = taos_query(taos, "CREATE DATABASE IF NOT EXISTS power");
+    taos_free_result(res);
+    res = taos_query(taos, "CREATE STABLE IF NOT EXISTS power.meters "
+                           "(ts TIMESTAMP, current FLOAT, voltage INT, phase FLOAT) "
+                           "TAGS (groupId INT, location BINARY(24))");
+    taos_free_result(res);
+
+    // Initialize STMT2
+    TAOS_STMT2_OPTION option = {0, false, false, NULL, NULL};
+    TAOS_STMT2 *stmt2 = taos_stmt2_init(taos, &option);
+    if (!stmt2) {
+        fprintf(stderr, "stmt2_init failed\n");
+        taos_close(taos);
+        taos_cleanup();
+        return -1;
+    }
+
+    // Prepare INSERT template: subtable name, tags, and columns use ?
+    int code = taos_stmt2_prepare(
+        stmt2,
+        "INSERT INTO ? USING meters TAGS(?,?) VALUES (?,?,?,?)",
+        0);
+    if (code != 0) {
+        fprintf(stderr, "Prepare failed: %s\n", taos_stmt2_error(stmt2));
+        taos_stmt2_close(stmt2);
+        taos_close(taos);
+        taos_cleanup();
+        return -1;
+    }
+
+    // Build bind data for NUM_TABLES subtables, each with NUM_ROWS rows
+    char            **tbnames = malloc(NUM_TABLES * sizeof(char *));
+    TAOS_STMT2_BIND **tags    = malloc(NUM_TABLES * sizeof(TAOS_STMT2_BIND *));
+    TAOS_STMT2_BIND **cols    = malloc(NUM_TABLES * sizeof(TAOS_STMT2_BIND *));
+
+    for (int i = 0; i < NUM_TABLES; i++) {
+        tbnames[i] = malloc(32);
+        sprintf(tbnames[i], "d_bind_%d", i);
+
+        // Tags: groupId (INT) and location (BINARY)
+        int   *gid     = malloc(sizeof(int));   *gid = i;
+        int   *gid_len = malloc(sizeof(int));   *gid_len = sizeof(int);
+        char  *loc     = malloc(24);             sprintf(loc, "location_%d", i);
+        int   *loc_len = malloc(sizeof(int));   *loc_len = strlen(loc);
+
+        tags[i] = malloc(2 * sizeof(TAOS_STMT2_BIND));
+        tags[i][0] = (TAOS_STMT2_BIND){TSDB_DATA_TYPE_INT,    gid, gid_len, NULL, 1};
+        tags[i][1] = (TAOS_STMT2_BIND){TSDB_DATA_TYPE_BINARY, loc, loc_len, NULL, 1};
+
+        // Columns: ts, current, voltage, phase
+        int64_t *ts      = malloc(NUM_ROWS * sizeof(int64_t));
+        float   *current = malloc(NUM_ROWS * sizeof(float));
+        int     *voltage = malloc(NUM_ROWS * sizeof(int));
+        float   *phase   = malloc(NUM_ROWS * sizeof(float));
+        int32_t *ts_len  = malloc(NUM_ROWS * sizeof(int32_t));
+        int32_t *cur_len = malloc(NUM_ROWS * sizeof(int32_t));
+        int32_t *vol_len = malloc(NUM_ROWS * sizeof(int32_t));
+        int32_t *pha_len = malloc(NUM_ROWS * sizeof(int32_t));
+
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        for (int j = 0; j < NUM_ROWS; j++) {
+            ts[j]      = tv.tv_sec * 1000LL + tv.tv_usec / 1000 + j;
+            current[j] = (float)rand() / RAND_MAX * 30;
+            voltage[j] = rand() % 300;
+            phase[j]   = (float)rand() / RAND_MAX;
+            ts_len[j]  = sizeof(int64_t);
+            cur_len[j] = sizeof(float);
+            vol_len[j] = sizeof(int);
+            pha_len[j] = sizeof(float);
+        }
+
+        cols[i] = malloc(4 * sizeof(TAOS_STMT2_BIND));
+        cols[i][0] = (TAOS_STMT2_BIND){TSDB_DATA_TYPE_TIMESTAMP, ts,      ts_len,  NULL, NUM_ROWS};
+        cols[i][1] = (TAOS_STMT2_BIND){TSDB_DATA_TYPE_FLOAT,     current, cur_len, NULL, NUM_ROWS};
+        cols[i][2] = (TAOS_STMT2_BIND){TSDB_DATA_TYPE_INT,       voltage, vol_len, NULL, NUM_ROWS};
+        cols[i][3] = (TAOS_STMT2_BIND){TSDB_DATA_TYPE_FLOAT,     phase,   pha_len, NULL, NUM_ROWS};
+    }
+
+    TAOS_STMT2_BINDV bindv = {NUM_TABLES, tbnames, tags, cols};
+    code = taos_stmt2_bind_param(stmt2, &bindv, -1);
+    if (code != 0) {
+        fprintf(stderr, "Bind failed: %s\n", taos_stmt2_error(stmt2));
+        taos_stmt2_close(stmt2);
+        taos_close(taos);
+        taos_cleanup();
+        return -1;
+    }
+
+    int affected = 0;
+    code = taos_stmt2_exec(stmt2, &affected);
+    if (code != 0) {
+        fprintf(stderr, "Exec failed: %s\n", taos_stmt2_error(stmt2));
+    } else {
+        printf("Inserted %d rows\n", affected);
+    }
+
+    taos_stmt2_close(stmt2);
+    taos_close(taos);
+    taos_cleanup();
+    return 0;
+}
+```
+
+<Note>
+The older `taos_stmt_init()` / `taos_stmt_prepare()` / `taos_stmt_execute()` API (STMT v1) still works but only supports a single table per execute call and synchronous execution. The STMT2 API supports multiple subtables per call, asynchronous execution, and efficient write mode.
+</Note>
+
+## Schemaless insert
+
+The schemaless API lets you write data without defining table schemas in advance. TDengine creates and maintains the required supertables and subtables automatically based on the data format.
+
+Three protocols are supported: InfluxDB Line Protocol, OpenTSDB Telnet, and OpenTSDB JSON.
+
+```c
+TAOS_RES *taos_schemaless_insert(TAOS *taos, const char *lines[],
+                                  int numLines, int protocol, int precision);
+```
+
+| Parameter | Values |
+|---|---|
+| `protocol` | `TSDB_SML_LINE_PROTOCOL`, `TSDB_SML_TELNET_PROTOCOL`, `TSDB_SML_JSON_PROTOCOL` |
+| `precision` | `TSDB_SML_TIMESTAMP_MILLI_SECONDS`, `TSDB_SML_TIMESTAMP_MICRO_SECONDS`, `TSDB_SML_TIMESTAMP_NANO_SECONDS`, etc. |
+
+### Schemaless example
+
+```c
+// to compile: gcc -o sml_insert_demo sml_insert_demo.c -ltaos
+
+#include <stdio.h>
+#include <stdlib.h>
+#include "taos.h"
+
+int main() {
+    taos_options(TSDB_OPTION_DRIVER, "websocket");
+
+    TAOS *taos = taos_connect("localhost", "root", "taosdata", NULL, 6041);
+    if (taos == NULL) {
+        fprintf(stderr, "Connect failed: %s\n", taos_errstr(NULL));
+        taos_cleanup();
+        return -1;
+    }
+
+    TAOS_RES *res = taos_query(taos, "CREATE DATABASE IF NOT EXISTS power");
+    taos_free_result(res);
+    res = taos_query(taos, "USE power");
+    taos_free_result(res);
+
+    // InfluxDB Line Protocol
+    char *line_data =
+        "meters,groupid=2,location=California.SanFrancisco "
+        "current=10.3000002f64,voltage=219i32,phase=0.31f64 1626006833639";
+    char *lines[] = {line_data};
+    res = taos_schemaless_insert(taos, lines, 1,
+                                  TSDB_SML_LINE_PROTOCOL,
+                                  TSDB_SML_TIMESTAMP_MILLI_SECONDS);
+    if (taos_errno(res) != 0) {
+        fprintf(stderr, "Line protocol insert failed: %s\n", taos_errstr(res));
+    } else {
+        printf("Inserted %d rows via InfluxDB Line Protocol\n",
+               taos_affected_rows(res));
+    }
+    taos_free_result(res);
+
+    // OpenTSDB Telnet Protocol
+    char *telnet_data = "metric_telnet 1707095283260 4 host=host0 interface=eth0";
+    char *telnets[] = {telnet_data};
+    res = taos_schemaless_insert(taos, telnets, 1,
+                                  TSDB_SML_TELNET_PROTOCOL,
+                                  TSDB_SML_TIMESTAMP_MILLI_SECONDS);
+    if (taos_errno(res) == 0) {
+        printf("Inserted %d rows via OpenTSDB Telnet Protocol\n",
+               taos_affected_rows(res));
+    }
+    taos_free_result(res);
+
+    taos_close(taos);
+    taos_cleanup();
+    return 0;
+}
+```
+
+## Asynchronous queries
+
+The asynchronous API uses callback functions and returns immediately without blocking. Use `taos_query_a()` to submit an SQL statement asynchronously, and `taos_fetch_rows_a()` to retrieve result rows in batches from the callback.
+
+```c
+void taos_query_a(TAOS *taos, const char *sql,
+                  void (*fp)(void *param, TAOS_RES *res, int code),
+                  void *param);
+
+void taos_fetch_rows_a(TAOS_RES *res,
+                       void (*fp)(void *param, TAOS_RES *res, int numOfRows),
+                       void *param);
+```
+
+The callback `fp` receives:
+- `param` — the user data pointer passed to `taos_query_a()`
+- `res` — the result set
+- `code` — `0` on success, negative on failure
+
+### Async example
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include "taos.h"
+
+// Callback to retrieve rows after async query completes
+void fetch_callback(void *param, TAOS_RES *res, int numOfRows) {
+    if (numOfRows > 0) {
+        for (int i = 0; i < numOfRows; i++) {
+            TAOS_ROW row = taos_fetch_row(res);
+            // process row ...
+        }
+        // fetch the next batch
+        taos_fetch_rows_a(res, fetch_callback, param);
+    } else {
+        if (numOfRows < 0) {
+            fprintf(stderr, "Fetch error: %s\n", taos_errstr(res));
+        }
+        // All rows consumed
+        taos_free_result(res);
+    }
+}
+
+// Callback invoked when taos_query_a() completes
+void query_callback(void *param, TAOS_RES *res, int code) {
+    if (code != 0) {
+        fprintf(stderr, "Query failed, code: %d, message: %s\n",
+                code, taos_errstr(res));
+        taos_free_result(res);
+        return;
+    }
+    // Start fetching rows asynchronously
+    taos_fetch_rows_a(res, fetch_callback, param);
+}
+
+int main() {
+    taos_options(TSDB_OPTION_DRIVER, "websocket");
+
+    TAOS *taos = taos_connect("localhost", "root", "taosdata", NULL, 6041);
+    if (taos == NULL) {
+        fprintf(stderr, "Connect failed: %s\n", taos_errstr(NULL));
+        taos_cleanup();
+        return -1;
+    }
+
+    taos_query_a(taos, "SELECT ts, current FROM power.meters LIMIT 100",
+                 query_callback, NULL);
+
+    // In a real application, wait for callbacks to complete
+    // (e.g., using a semaphore or event loop)
+    sleep(2);
+
+    taos_close(taos);
+    taos_cleanup();
+    return 0;
+}
+```
+
+<Warning>
+**Client applications must ensure operations on the same table are fully serialized.** Do not start a second insert or query on the same table before the first one has returned.
+</Warning>
+
+## API quick reference
+
+| Function | Description |
+|---|---|
+| `taos_options()` | Set global options (driver type, timezone, locale) |
+| `taos_connect()` | Open a connection |
+| `taos_close()` | Close a connection |
+| `taos_cleanup()` | Clean up the runtime environment |
+| `taos_query()` | Execute an SQL statement (synchronous) |
+| `taos_fetch_row()` | Fetch the next row |
+| `taos_fetch_fields()` | Get column metadata |
+| `taos_field_count()` | Get the number of columns |
+| `taos_affected_rows()` | Get the number of affected rows |
+| `taos_free_result()` | Free a result set |
+| `taos_errno()` | Get the error code from a result |
+| `taos_errstr()` | Get the error message from a result |
+| `taos_query_a()` | Execute an SQL statement (asynchronous) |
+| `taos_fetch_rows_a()` | Fetch rows asynchronously |
+| `taos_stmt2_init()` | Initialize a STMT2 object |
+| `taos_stmt2_prepare()` | Parse a parameterized SQL template |
+| `taos_stmt2_bind_param()` | Bind data to the STMT2 object |
+| `taos_stmt2_exec()` | Execute the bound batch |
+| `taos_stmt2_close()` | Close and free a STMT2 object |
+| `taos_schemaless_insert()` | Schemaless batch insert |

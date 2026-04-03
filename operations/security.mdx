@@ -1,0 +1,430 @@
+---
+title: "Security"
+description: "Secure TDengine with user management, role-based access control, IP whitelisting, TLS, and audit logs."
+---
+
+TDengine provides layered security controls: user and permission management (all editions), IP whitelisting, audit logs, and transparent data encryption (Enterprise only).
+
+## User management
+
+### Create a user
+
+```sql
+CREATE USER user_name PASS 'password'
+  [SYSINFO {1|0}]
+  [CREATEDB {1|0}]
+  [ENABLE {1|0}]
+  [FAILED_LOGIN_ATTEMPTS {value | DEFAULT | UNLIMITED}]
+  [PASSWORD_LIFE_TIME {value | DEFAULT | UNLIMITED}]
+  [HOST {ip | ip_range} [, {ip | ip_range}] ...]
+  [NOT_ALLOW_HOST {ip | ip_range} [, {ip | ip_range}] ...];
+```
+
+Key options:
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `SYSINFO` | Whether the user can view system information (dnodes, vnodes, storage) | `1` (can view) |
+| `CREATEDB` | Whether the user can create databases | `0` (cannot) |
+| `ENABLE` | Whether the user can log in | `1` (enabled) |
+| `FAILED_LOGIN_ATTEMPTS` | Max consecutive failed login attempts before lockout | `3` (when advanced security on) |
+| `PASSWORD_LIFE_TIME` | Password validity in days | `90` (when advanced security on) |
+| `HOST` | IP whitelist for this user | Allows all |
+| `NOT_ALLOW_HOST` | IP blacklist for this user | Blocks none |
+
+Passwords must be 8–255 characters and include at least three of: uppercase letters, lowercase letters, digits, and special characters (`! @ # $ % ^ & * ( ) - _ + = [ ] { } : ; > < ? | ~ , .`).
+
+Example — create a read-only user:
+
+```sql
+CREATE USER analyst PASS 'Analyst@2024!' SYSINFO 0 CREATEDB 0;
+```
+
+### View users
+
+```sql
+SHOW USERS;
+SELECT * FROM information_schema.ins_users;
+```
+
+### Modify a user
+
+```sql
+-- Disable a user
+ALTER USER analyst ENABLE 0;
+
+-- Reset password
+ALTER USER analyst PASS 'NewPass@2024!';
+
+-- Add IP whitelist entry
+ALTER USER analyst ADD HOST '192.168.1.0/24';
+
+-- Remove IP whitelist entry
+ALTER USER analyst DROP HOST '192.168.1.0/24';
+```
+
+### Delete a user
+
+```sql
+DROP USER IF EXISTS analyst;
+```
+
+## Role-based access control
+
+<Note>
+RBAC is available in TDengine Enterprise. In community edition 3.4.0.0+, `GRANT`/`REVOKE` syntax returns an error. In 3.3.x.y community editions, the syntax is accepted but has no effect.
+</Note>
+
+### Separation of three powers (Enterprise 3.4.0.0+)
+
+TDengine Enterprise implements a three-role separation model:
+
+| Role | Responsibilities |
+|------|-----------------|
+| `SYSDBA` | Database administration, user creation, system management |
+| `SYSSEC` | Permission grants and revokes, security policy |
+| `SYSAUDIT` | Audit supervision, audit database management |
+
+A user cannot hold two or more of these roles simultaneously.
+
+After initial setup, separate the root user's combined permissions:
+
+```sql
+CREATE USER dba_user PASS 'DbaPass123!@#';
+CREATE USER sec_user PASS 'SecPass123!@#';
+CREATE USER audit_user PASS 'AuditPass123!@#';
+
+GRANT ROLE `SYSDBA` TO dba_user;
+GRANT ROLE `SYSSEC` TO sec_user;
+GRANT ROLE `SYSAUDIT` TO audit_user;
+```
+
+### Creating and assigning custom roles
+
+```sql
+-- Create a role
+CREATE ROLE analyst_role;
+
+-- Grant permissions to the role
+GRANT SHOW, SELECT ON TABLE power.* TO analyst_role;
+GRANT SHOW, USE ON DATABASE power TO analyst_role;
+
+-- Assign the role to a user
+GRANT ROLE analyst_role TO analyst;
+
+-- Create a write role
+CREATE ROLE writer_role;
+GRANT INSERT ON TABLE power.* TO writer_role;
+GRANT SHOW, USE, CREATE TABLE ON DATABASE power TO writer_role;
+GRANT ROLE writer_role TO collector;
+```
+
+## GRANT and REVOKE permissions
+
+### Database permissions
+
+```sql
+-- Allow user to access the database
+GRANT USE ON DATABASE power TO analyst;
+
+-- Allow user to create tables in the database
+GRANT CREATE TABLE, CREATE VIEW ON DATABASE power TO creator;
+
+-- Grant all permissions on a database
+GRANT ALL ON DATABASE power TO admin_user;
+
+-- Revoke access
+REVOKE ALL ON DATABASE power FROM analyst;
+```
+
+### Table permissions
+
+```sql
+-- Read-only on a specific table
+GRANT SELECT ON TABLE power.meters TO analyst;
+
+-- Write-only to all tables in a database
+GRANT INSERT ON TABLE power.* TO collector;
+
+-- Full access to a specific table
+GRANT SELECT, INSERT, DELETE ON TABLE power.devices TO operator;
+```
+
+### Row and column permissions (Enterprise 3.4.0.0+)
+
+Restrict a user to specific rows using `WITH`:
+
+```sql
+-- User sees only data from sensor_001
+GRANT SELECT ON TABLE power.meters WITH source='sensor_001' TO analyst;
+
+-- User sees only data after 2024-01-01
+GRANT SELECT ON TABLE power.meters WITH ts >= '2024-01-01' TO analyst;
+```
+
+Restrict a user to specific columns:
+
+```sql
+-- User can only read ts and power columns
+GRANT SELECT (ts, power) ON TABLE power.meters TO analyst;
+
+-- User can only write to ts and temperature columns
+GRANT INSERT (ts, temperature) ON TABLE power.meters TO writer;
+```
+
+### Subscription permissions
+
+```sql
+GRANT SUBSCRIBE ON topic_name TO user_name;
+REVOKE SUBSCRIBE ON topic_name FROM user_name;
+```
+
+### View current permissions
+
+```sql
+SHOW USER PRIVILEGES;
+SELECT * FROM information_schema.ins_user_privileges;
+
+SHOW ROLE PRIVILEGES;
+SELECT * FROM information_schema.ins_role_privileges;
+```
+
+## Token-based authentication (Enterprise 3.4.0.0+)
+
+Tokens provide an alternative to password authentication, suitable for service accounts and API access.
+
+```sql
+-- Create a token for a user
+CREATE TOKEN my_service_token FROM USER collector;
+
+-- The token value is only shown once at creation time
+-- Save it immediately
+
+-- View tokens (token value is not retrievable after creation)
+SHOW TOKENS;
+
+-- Disable a token
+ALTER TOKEN my_service_token ENABLE 0;
+
+-- Delete a token
+DROP TOKEN IF EXISTS my_service_token;
+```
+
+### TOTP two-factor authentication (Enterprise 3.4.0.1+)
+
+```sql
+-- Create or update a TOTP secret for a user
+CREATE TOTP_SECRET FOR USER analyst;
+-- Returns a one-time secret — save it to configure your TOTP app
+
+-- Remove TOTP (disables 2FA for that user)
+DROP TOTP_SECRET FROM USER analyst;
+```
+
+TDengine requires 6-digit TOTP codes with a 30-second rotation period. Configure your TOTP app (e.g., Google Authenticator) accordingly.
+
+## IP whitelisting (Enterprise 3.2.0.0+)
+
+IP whitelisting restricts database access to trusted IP addresses.
+
+Enable whitelisting in `taos.cfg`:
+
+```shell
+enableWhiteList 1
+```
+
+<Warning>
+All nodes in a cluster must have `enableWhiteList` set to the same value (all `0` or all `1`). Mixed settings prevent the cluster from starting.
+</Warning>
+
+Manage allowed hosts per user:
+
+```sql
+-- Add hosts at user creation
+CREATE USER analyst PASS 'Analyst@2024!' HOST '192.168.1.0/24','10.0.0.1';
+
+-- Add host to existing user
+ALTER USER analyst ADD HOST '10.0.0.0/8';
+
+-- Remove a host
+ALTER USER analyst DROP HOST '10.0.0.0/8';
+
+-- Query current whitelist
+SELECT name, allowed_host FROM information_schema.ins_users;
+```
+
+Notes:
+
+- `127.0.0.1` is automatically added to every user's whitelist.
+- IP addresses of cluster nodes are automatically whitelisted but do not appear in `ins_users`.
+- When taosAdapter runs on a separate machine from taosd, manually add the taosAdapter IP to the taosd whitelist.
+- Whitelist changes take effect within 1–2 seconds.
+- For a user, the maximum allowed IP entries is 2,048.
+
+## TLS configuration
+
+### taosAdapter (RESTful/WebSocket)
+
+Add to `/etc/taos/taosadapter.toml`:
+
+```toml
+[ssl]
+enable = true
+certFile = "/path/to/certificate.pem"
+keyFile = "/path/to/private-key.pem"
+```
+
+### taosExplorer (web UI)
+
+Add to `/etc/taos/explorer.toml`:
+
+```toml
+[ssl]
+certificate = "/path/to/ca.pem"
+certificate_key = "/path/to/key.pem"
+```
+
+Access Explorer with HTTPS after restarting the service.
+
+### taosX (Enterprise)
+
+Add to `/etc/taos/taosx.toml`:
+
+```toml
+[serve]
+ssl_cert = "/path/to/server.pem"
+ssl_key = "/path/to/server.key"
+ssl_ca = "/path/to/ca.pem"
+```
+
+Restrict taosX API to localhost if you do not need external access:
+
+```toml
+[serve]
+listen = "127.0.0.1:6050"
+grpc = "127.0.0.1:6055"
+```
+
+### Nginx TLS termination
+
+Use Nginx to terminate TLS for taosAdapter connections:
+
+```nginx
+http {
+    server {
+        listen 443 ssl;
+        ssl_certificate /path/to/certificate.crt;
+        ssl_certificate_key /path/to/private.key;
+
+        location / {
+            proxy_pass http://taosadapter_backends;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+        }
+    }
+
+    upstream taosadapter_backends {
+        server 192.168.11.61:6041;
+        server 192.168.11.62:6041;
+        server 192.168.11.63:6041;
+    }
+}
+```
+
+## Audit logs (Enterprise 3.1.1.0+)
+
+Audit logs record user operations and send them to taosKeeper, which persists them to a dedicated audit database.
+
+### Enable audit in taosd
+
+In `/etc/taos/taos.cfg`:
+
+```shell
+audit 1
+monitorFqdn localhost      # taosKeeper FQDN
+monitorPort 6043
+auditLevel 3               # 1=system, 2=cluster, 3=database, 4=table
+```
+
+### Create the audit database
+
+```sql
+CREATE DATABASE audit_db KEEP 36500d IS_AUDIT 1 ENCRYPT_ALGORITHM 'SM4-CBC' WAL_LEVEL 2;
+```
+
+Audit databases have enforced defaults: `keep` must be at least 1825 days, `WAL_LEVEL` is fixed at 2.
+
+### Configure taosKeeper
+
+In `/etc/taos/taoskeeper.toml`:
+
+```toml
+auditDB = "audit"
+```
+
+taosKeeper creates the audit database automatically if it does not exist.
+
+### View audit logs
+
+From taosExplorer: **System Management → Audit**.
+
+From taos CLI:
+
+```sql
+USE audit;
+SELECT * FROM operations ORDER BY ts DESC LIMIT 20;
+```
+
+Each audit record contains:
+
+| Field | Description |
+|-------|-------------|
+| `ts` | Timestamp of the operation |
+| `user_name` | User who performed the operation |
+| `operation` | Operation type (e.g., `createDB`, `dropUser`, `login`) |
+| `db` | Database involved |
+| `resource` | Resource involved |
+| `client_address` | Client IP and port |
+| `details` | SQL or additional context |
+
+### Audit levels
+
+| Level | Scope | Examples |
+|-------|-------|---------|
+| `auditLevel 1` | System | Create/drop dnode, mnode, qnode |
+| `auditLevel 2` | Cluster | Alter cluster, grant/revoke, login, create/drop user |
+| `auditLevel 3` | Database | Create/drop/alter database, create/drop supertable, create/drop stream |
+| `auditLevel 4` | Table | Create/drop child tables |
+
+## Transparent data encryption (Enterprise 3.3.0.0+)
+
+TDengine supports encrypting data files at rest using SM4 or AES-128 in CBC mode. The `taosk` tool manages encryption keys.
+
+Generate keys:
+
+```bash
+taosk -c /etc/taos \
+  --encrypt-server \
+  --encrypt-database \
+  --encrypt-config \
+  --encrypt-metadata \
+  --encrypt-data
+```
+
+Create an encrypted database:
+
+```sql
+CREATE DATABASE secure_db ENCRYPT_ALGORITHM 'SM4-CBC';
+```
+
+View encryption status:
+
+```sql
+SELECT * FROM information_schema.ins_encrypt_status;
+SELECT name, encrypt_algorithm FROM information_schema.ins_databases;
+```
+
+<Warning>
+The `ENCRYPT_ALGORITHM` of a database cannot be changed after creation. Encrypted databases cannot be accessed if the data files are moved to a different machine without restoring the encryption keys to that machine.
+</Warning>

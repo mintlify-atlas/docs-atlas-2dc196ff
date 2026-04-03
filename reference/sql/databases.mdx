@@ -1,0 +1,286 @@
+---
+title: "Databases"
+description: "SQL reference for creating, modifying, and managing TDengine databases, including all configuration parameters for storage, replication, caching, and retention."
+---
+
+## CREATE DATABASE
+
+```sql
+CREATE DATABASE [IF NOT EXISTS] db_name [database_options]
+
+database_options:
+    database_option ...
+
+database_option: {
+    VGROUPS value
+  | PRECISION {'ms' | 'us' | 'ns'}
+  | REPLICA value
+  | BUFFER value
+  | PAGES value
+  | PAGESIZE value
+  | CACHEMODEL {'none' | 'last_row' | 'last_value' | 'both'}
+  | CACHESIZE value
+  | CACHESHARDBITS value
+  | COMP {0 | 1 | 2}
+  | DURATION value
+  | MAXROWS value
+  | MINROWS value
+  | KEEP value
+  | KEEP_TIME_OFFSET value
+  | STT_TRIGGER value
+  | SINGLE_STABLE {0 | 1}
+  | TABLE_PREFIX value
+  | TABLE_SUFFIX value
+  | TSDB_PAGESIZE value
+  | WAL_LEVEL {1 | 2}
+  | WAL_FSYNC_PERIOD value
+  | WAL_RETENTION_PERIOD value
+  | WAL_RETENTION_SIZE value
+}
+```
+
+### Example
+
+```sql
+CREATE DATABASE IF NOT EXISTS power
+  VGROUPS 10
+  BUFFER 256
+  PRECISION 'ms'
+  KEEP 3650
+  DURATION 10d
+  REPLICA 1
+  CACHEMODEL 'both'
+  CACHESIZE 64;
+```
+
+### Core Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `VGROUPS` | — | Number of initial vgroups. More vgroups increase write parallelism. |
+| `PRECISION` | `ms` | Timestamp precision: `ms` (milliseconds), `us` (microseconds), `ns` (nanoseconds). |
+| `REPLICA` | `1` | Number of data replicas: `1`, `2` (Enterprise ≥ v3.3.0.0), or `3`. Must be ≤ number of DNODEs. |
+| `KEEP` | `3650` | Data retention period in days. Range `[1, 365000]`. Must be ≥ 3× `DURATION`. Enterprise supports up to 3 tiers: `KEEP 30d,90d,3650d`. |
+| `DURATION` | `10d` | Time span per data file. Range `[60m, 3650d]`. Supports `m`, `h`, `d` units. |
+| `BUFFER` | `256` | Write buffer per VNODE in MB. Range `[3, 16384]`. |
+
+### Caching Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `CACHEMODEL` | `none` | Read caching strategy for latest subtable data. |
+| `CACHESIZE` | `1` | Cache size per vnode in MB. Range `[1, 65536]`. |
+| `CACHESHARDBITS` | `-1` | LRU cache shard bits `[-1, 19]`. `-1` = auto. More shards reduce lock contention. |
+
+**CACHEMODEL values:**
+
+| Value | Description |
+|-------|-------------|
+| `none` | No caching |
+| `last_row` | Cache latest row per subtable. Accelerates `LAST_ROW` queries. |
+| `last_value` | Cache latest non-NULL value per column. Accelerates `LAST` queries. |
+| `both` | Enable both `last_row` and `last_value` caching. |
+
+<Warning>
+Switching `CACHEMODEL` values back and forth may cause inaccurate `LAST`/`LAST_ROW` results. Keep the setting stable once chosen.
+</Warning>
+
+### Storage Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `PAGES` | `256` | Metadata cache pages per VNODE. Min `64`. Memory = `PAGESIZE × PAGES`. |
+| `PAGESIZE` | `4` | Metadata page size in KB. Range `[1, 16384]`. |
+| `TSDB_PAGESIZE` | `4` | Time-series data page size in KB. Range `[1, 16384]`. |
+| `MAXROWS` | `4096` | Maximum records per file block. |
+| `MINROWS` | `100` | Minimum records per file block. |
+| `COMP` | `2` | Compression: `0` = none, `1` = first-stage, `2` = two-stage. |
+| `STT_TRIGGER` | — | Number of on-disk files that trigger file merges. Increase for many-table, low-frequency write scenarios. |
+| `SINGLE_STABLE` | `0` | `1` = only one supertable allowed in this database. |
+
+### WAL Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `WAL_LEVEL` | `1` | `1` = write WAL without fsync; `2` = write WAL with fsync. |
+| `WAL_FSYNC_PERIOD` | `3000` | fsync period in ms when `WAL_LEVEL=2`. Range `[0, 180000]`. `0` = immediate. |
+| `WAL_RETENTION_PERIOD` | `3600` | Extra WAL retention duration in seconds for data subscription. |
+| `WAL_RETENTION_SIZE` | `0` | Extra WAL retention size in KB. `0` = no limit. |
+
+### Table Distribution Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `TABLE_PREFIX value` | Positive: ignore the first `n` chars of table name for vgroup assignment. Negative: use only the first `n` chars. |
+| `TABLE_SUFFIX value` | Positive: ignore the last `n` chars. Negative: use only the last `n` chars. |
+
+### Data Retention Timing
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `KEEP_TIME_OFFSET` | `0` | Hours to delay KEEP-triggered deletion/migration. Avoids peak business periods. Available from v3.2.0.0. |
+
+### Enterprise-Only Parameters
+
+These parameters require TDengine Enterprise:
+
+| Parameter | Description |
+|-----------|-------------|
+| `COMPACT_INTERVAL` | Automatic compaction interval. Range `[10m, KEEP2]`. Default `0` (disabled). |
+| `COMPACT_TIME_RANGE` | Time range for automatic compaction (e.g., `-300, -200` means 300–200 days in the past). |
+| `COMPACT_TIME_OFFSET` | Hour of day to trigger automatic compaction. Range `[0, 23]`. |
+| `SS_KEEPLOCAL` | Minimum days to keep data locally before migrating to shared storage. |
+| `SS_CHUNKPAGES` | Minimum file size (TSDB pages) before migration to shared storage. |
+| `SS_COMPACT` | `1` = compact files before first migration; `0` = skip compaction. |
+| `DNODES` | Specify DNODE list for VNODE placement (comma-separated, no spaces). |
+
+---
+
+## USE DATABASE
+
+```sql
+USE db_name;
+```
+
+Switches the active database for the current session.
+
+---
+
+## DROP DATABASE
+
+```sql
+DROP DATABASE [IF EXISTS] db_name;
+```
+
+<Warning>
+Dropping a database permanently deletes **all tables, data, and vgroups** in that database. This operation is irreversible.
+</Warning>
+
+---
+
+## ALTER DATABASE
+
+Modify parameters of an existing database. Not all parameters can be changed after creation.
+
+```sql
+ALTER DATABASE db_name alter_database_option ...
+
+alter_database_option: {
+    CACHEMODEL {'none' | 'last_row' | 'last_value' | 'both'}
+  | CACHESIZE value
+  | CACHESHARDBITS value
+  | BUFFER value
+  | PAGES value
+  | REPLICA value
+  | STT_TRIGGER value
+  | WAL_LEVEL value
+  | WAL_FSYNC_PERIOD value
+  | KEEP value
+  | WAL_RETENTION_PERIOD value
+  | WAL_RETENTION_SIZE value
+  | MINROWS value
+}
+```
+
+**Examples:**
+
+```sql
+-- Extend data retention to 5 years
+ALTER DATABASE power KEEP 1825;
+
+-- Enable full caching
+ALTER DATABASE power CACHEMODEL 'both' CACHESIZE 128;
+
+-- Increase cache shards for high concurrency
+ALTER DATABASE power CACHESHARDBITS 6;
+```
+
+<Note>
+Modifying `CACHESHARDBITS` immediately invalidates all last-value LRU cache entries in every vnode. Subsequent queries reload cached data from disk, which may temporarily increase query latency.
+</Note>
+
+---
+
+## SHOW DATABASES
+
+```sql
+-- List all databases
+SHOW DATABASES;
+
+-- Show the CREATE statement for a specific database
+SHOW CREATE DATABASE db_name \G;
+
+-- Query detailed parameters
+SELECT * FROM INFORMATION_SCHEMA.INS_DATABASES WHERE NAME = 'db_name' \G;
+```
+
+---
+
+## Database Maintenance
+
+### Check Availability
+
+```sql
+SHOW db_name.ALIVE;
+-- Returns: 0 (unavailable), 1 (fully available), 2 (partially available)
+```
+
+### Flush to Disk
+
+```sql
+FLUSH DATABASE db_name;
+```
+
+Writes all in-memory data to disk. Run before shutting down a node to speed up restart.
+
+### Delete Expired Data
+
+```sql
+TRIM DATABASE db_name;
+```
+
+Immediately deletes data that has exceeded the `KEEP` retention period and reorganizes data according to multi-tier storage configuration.
+
+### Delete Expired WAL
+
+```sql
+TRIM DATABASE db_name WAL;
+```
+
+Deletes expired WAL log files, bypassing vgroup `keep_version` restrictions.
+
+### View Disk Usage
+
+```sql
+-- Per-module disk usage
+SELECT * FROM INFORMATION_SCHEMA.INS_DISK_USAGE WHERE db_name = 'power';
+
+-- Compression ratio and total disk usage
+SHOW power.disk_info;
+```
+
+### vgroup Distribution
+
+```sql
+-- Redistribute vnodes in a specific vgroup
+REDISTRIBUTE VGROUP vgroup_no DNODE dnode_id1 [DNODE dnode_id2] [DNODE dnode_id3];
+
+-- Automatically rebalance all vgroups in the cluster
+BALANCE VGROUP;
+```
+
+---
+
+## Monitoring cachesize
+
+To determine if `CACHESIZE` is sufficient:
+
+```sql
+-- View current cachesize setting
+SELECT cachesize FROM INFORMATION_SCHEMA.INS_DATABASES WHERE name = 'power';
+
+-- View actual cache load per vgroup
+SHOW power.vgroups;
+```
+
+If `cacheload` is close to `cachesize`, increase `CACHESIZE`. If significantly lower, the current size is adequate.

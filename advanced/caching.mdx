@@ -1,0 +1,177 @@
+---
+title: "Caching"
+description: "TDengine's built-in last-row read cache for real-time IoT queries — configure cachemodel and cachesize to eliminate the need for external Redis."
+---
+
+In IoT and Industrial IoT applications, the value of real-time data often far exceeds historical data. Operators monitoring production line equipment need current readings for temperature, pressure, and speed — not last hour's averages. Vehicle dispatch systems need live location data. Smart meter dashboards need the most recent consumption values.
+
+TDengine provides a **built-in read cache** specifically designed for these high-frequency real-time query patterns, so you can get the latest device state without deploying an external caching layer.
+
+## The Problem with External Caching
+
+Many teams add Redis between their application and their time-series database to accelerate last-value queries. This approach introduces several problems:
+
+- **Increased system complexity**: You must deploy and maintain a separate cache cluster with its own architecture requirements.
+- **Rising operational costs**: Additional hardware resources and management overhead are required.
+- **Consistency issues**: Keeping the cache and database in sync requires additional synchronization mechanisms. Without them, data inconsistencies occur.
+
+## TDengine's Built-In Read Cache
+
+TDengine automatically caches the latest data for each subtable in memory. When you query for the most recent value of a device, TDengine returns the result directly from cache — without touching disk.
+
+The cache uses a **time-driven management strategy**: the most recent data is prioritized in memory. When the cache reaches its configured limit, the oldest data is batch-written to disk. This reduces disk write load and extends hardware lifespan.
+
+## Configuring the Cache
+
+You control caching behavior per database using two parameters: `cachemodel` and `cachesize`.
+
+### cachemodel
+
+The `cachemodel` parameter determines what is cached. It has four options:
+
+| Value | Behavior |
+|-------|----------|
+| `none` | No caching. All queries read from disk. |
+| `last_row` | Caches the most recent row of data from each subtable. Significantly improves performance of the `LAST_ROW()` function. |
+| `last_value` | Caches the most recent non-NULL value of each column from each subtable. Significantly improves performance of the `LAST()` function when there are no special query effects (such as `WHERE`, `ORDER BY`, `GROUP BY`, or `INTERVAL`). |
+| `both` | Caches both the most recent row and the most recent per-column non-NULL value. Equivalent to `last_row` and `last_value` simultaneously. |
+
+### cachesize
+
+The `cachesize` parameter controls how much memory each vnode allocates for caching:
+
+- **Default**: 1 MB
+- **Range**: 1–65536 MB
+- **Unit**: MB, per vnode
+
+Configure `cachesize` based on the number of subtables in the vnode and available machine memory.
+
+### Setting Cache Parameters at Database Creation
+
+```sql
+CREATE DATABASE power
+  CACHEMODEL 'both'
+  CACHESIZE 10;
+```
+
+### Enabling Cache on an Existing Database
+
+You can enable or change caching on an existing database with `ALTER DATABASE`:
+
+```sql
+ALTER DATABASE power CACHEMODEL 'both';
+```
+
+Verify the change took effect:
+
+```sql
+SHOW CREATE DATABASE power\G;
+```
+
+```
+*************************** 1.row ***************************
+       Database: power
+Create Database: CREATE DATABASE `power` BUFFER 256 CACHESIZE 1 CACHEMODEL 'both' COMP 2 DURATION 14400m ...
+Query OK, 1 row(s) in set (0.000282s)
+```
+
+## LAST\_ROW() and LAST() for Real-Time Monitoring
+
+Two functions benefit directly from the read cache:
+
+- **`LAST_ROW(col1, col2, ...)`** — Returns the most recent row as a unit (all columns share the same timestamp).
+- **`LAST(col1, col2, ...)`** — Returns the most recent non-NULL value of each specified column independently.
+
+Use `LAST_ROW()` when you need a consistent snapshot of the most recent reading. Use `LAST()` when devices may have NULL values and you want the most recent valid reading per column.
+
+## Measured Performance Impact
+
+The following example uses the `taosBenchmark` tool to create a test database of 10,000 smart electric meter subtables, each with 10,000 records (1 billion total rows):
+
+```bash
+taosBenchmark -d power -Q \
+  --start-timestamp=1600000000000 \
+  --tables=10000 \
+  --records=10000 \
+  --time-step=10000 \
+  -y
+```
+
+### Without Caching
+
+```sql
+SELECT last(ts, current) FROM meters;
+```
+
+```
+        last(ts)         |    last(current)     |
+=================================================
+ 2020-09-15 00:13:10.000 |            1.1294620 |
+Query OK, 1 row(s) in set (0.353815s)
+```
+
+```sql
+SELECT last_row(ts, current) FROM meters;
+```
+
+```
+      last_row(ts)       |  last_row(current)   |
+=================================================
+ 2020-09-15 00:13:10.000 |            1.1294620 |
+Query OK, 1 row(s) in set (0.344070s)
+```
+
+### Enable `both` Caching
+
+```sql
+ALTER DATABASE power CACHEMODEL 'both';
+```
+
+### With Caching Enabled
+
+The first query after enabling cache populates it. Subsequent queries return directly from memory:
+
+```sql
+SELECT last(ts, current) FROM meters;
+```
+
+```
+        last(ts)         |    last(current)     |
+=================================================
+ 2020-09-15 00:13:10.000 |            1.1294620 |
+Query OK, 1 row(s) in set (0.044021s)
+```
+
+```sql
+SELECT last_row(ts, current) FROM meters;
+```
+
+```
+      last_row(ts)       |  last_row(current)   |
+=================================================
+ 2020-09-15 00:13:10.000 |            1.1294620 |
+Query OK, 1 row(s) in set (0.046682s)
+```
+
+**Result**: Query latency dropped from ~350 ms to ~44 ms — an approximately **8× improvement** — across 1 billion rows, without any external cache infrastructure.
+
+## Choosing a cachemodel Value
+
+<CardGroup cols={2}>
+  <Card title="last_row" icon="table-rows">
+    Best when you query entire rows together and need a consistent timestamp across all columns. Ideal for dashboards displaying the full current state of a device.
+  </Card>
+  <Card title="last_value" icon="database">
+    Best when devices occasionally report NULL values and you need the most recent valid reading per column. Useful for sparse sensor data.
+  </Card>
+  <Card title="both" icon="layer-group">
+    Best when you use both `LAST_ROW()` and `LAST()` queries. Uses more memory but covers all real-time query patterns.
+  </Card>
+  <Card title="none" icon="xmark">
+    Use when storage efficiency matters more than read latency, or when your workload is write-heavy with infrequent last-value reads.
+  </Card>
+</CardGroup>
+
+<Tip>
+For most IoT monitoring workloads, `cachemodel 'both'` with a `cachesize` of 10–64 MB per vnode provides a good balance of memory usage and query performance.
+</Tip>

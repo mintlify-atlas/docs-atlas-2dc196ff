@@ -1,0 +1,204 @@
+---
+title: "taosd"
+description: "Reference for taosd, the core TDengine server daemon. Covers starting and stopping the service, key configuration parameters, log locations, and performance tuning."
+---
+
+taosd is the core service of the TDengine database engine. It manages storage, query execution, cluster membership, and replication. Its default configuration file is `/etc/taos/taos.cfg`.
+
+## Starting and stopping
+
+On Linux, use `systemctl` to manage the taosd service:
+
+```bash
+# Start
+systemctl start taosd
+
+# Stop
+systemctl stop taosd
+
+# Restart
+systemctl restart taosd
+
+# Check status
+systemctl status taosd
+```
+
+A running service reports:
+
+```text
+Active: active (running)
+```
+
+<Note>
+`systemctl` commands require root privileges. Add `sudo` if you are not the root user.
+</Note>
+
+## Command-line parameters
+
+You can pass parameters directly when launching taosd:
+
+| Flag | Description |
+|------|-------------|
+| `-a <json file>` | Load configuration from a JSON file, e.g. `{"fqdn":"td1"}` |
+| `-c <directory>` | Directory containing `taos.cfg` |
+| `-e` | Set an environment variable, e.g. `-e 'TAOS_FQDN=td1'` |
+| `-C` | Print current configuration and exit |
+| `-s` | Print SDB information |
+| `-k` | Retrieve the machine code |
+| `-dm` | Enable memory scheduling |
+| `-V` | Print version information |
+
+## Configuration parameters
+
+Configuration parameters fall into two categories:
+
+| Type | Scope | How to modify |
+|------|-------|---------------|
+| Global | All nodes in the cluster | `ALTER ALL DNODES 'param' 'value';` |
+| Local | Single node | `ALTER DNODE <id> 'param' 'value';` or `taos.cfg` |
+
+<Note>
+From version 3.4.0.0, the configuration file is only read on first startup. Use `ALTER` SQL commands to change parameters on a running cluster.
+</Note>
+
+View current values:
+
+```sql
+-- Cluster-wide parameters
+SHOW VARIABLES;
+
+-- Parameters for a specific dnode
+SHOW DNODE 1 VARIABLES;
+```
+
+### Connection parameters
+
+| Parameter | Default | Dynamic | Description |
+|-----------|---------|---------|-------------|
+| `firstEp` | `localhost:6030` | No | First dnode endpoint taosd connects to at startup |
+| `secondEp` | — | No | Fallback endpoint if `firstEp` is unreachable |
+| `fqdn` | First hostname on server | No | Address taosd listens on |
+| `serverPort` | `6030` | No | Port taosd listens on |
+| `numOfRpcSessions` | `30000` | After restart | Maximum RPC connections (range 1–100000) |
+| `numOfRpcThreads` | Half of CPU cores | After restart | Threads for RPC send/receive (range 1–1024) |
+| `numOfTaskQueueThreads` | 2× CPU cores (min 16) | After restart | Threads for processing client RPC messages |
+| `rpcQueueMemoryAllowed` | 1/10 of server RAM | Immediately | Max memory for queued RPC messages (bytes) |
+| `maxRetryWaitTime` | `20000` ms | After restart | Maximum reconnection timeout (range 3000–86400000 ms) |
+| `compressMsgSize` | `-1` | After restart | RPC compression: -1 = off, 0 = all, N = compress if > N bytes |
+| `readTimeout` | `900` s | After restart | Minimum timeout per request (range 64–604800 s) |
+| `shareConnLimit` | `10` | After restart | Requests a connection can share (range 1–512) |
+
+### Cluster and threading parameters
+
+| Parameter | Default | Dynamic | Description |
+|-----------|---------|---------|-------------|
+| `supportVnodes` | 2× CPU cores + 5 | Immediately | Max vnodes per dnode (range 0–1024) |
+| `numOfCommitThreads` | `4` | After restart | Commit threads (range 1–1024) |
+| `numOfCompactThreads` | `2` | After restart | Compaction threads (range 1–16) |
+| `numOfVnodeQueryThreads` | 2× CPU cores (max 16) | After restart | Query threads per vnode |
+| `numOfVnodeFetchThreads` | ¼ CPU cores (max 4) | After restart | Fetch threads per vnode |
+| `numOfMnodeReadThreads` | ⅛ CPU cores (max 4) | After restart | Read threads for mnode |
+
+### Storage parameters
+
+| Parameter | Default | Dynamic | Description |
+|-----------|---------|---------|-------------|
+| `dataDir` | `/var/lib/taos` | No | Data file directory |
+| `tempDir` | `/tmp` | No | Temporary file directory |
+| `minimalDataDirGB` | `2` GB | No | Minimum free space to reserve in `dataDir` |
+| `minimalTmpDirGB` | `1` GB | No | Minimum free space to reserve in `tempDir` |
+
+### Query parameters
+
+| Parameter | Default | Dynamic | Description |
+|-----------|---------|---------|-------------|
+| `queryBufferSize` | — | After restart | Not currently effective |
+| `queryUseMemoryPool` | `1` (on) | After restart | Use memory pool for query memory management |
+| `minReservedMemorySize` | `0` (auto) | Immediately | Minimum reserved system memory for queries (MB) |
+| `singleQueryMaxMemorySize` | `0` (no limit) | No | Per-query memory limit on a single dnode (MB) |
+| `countAlwaysReturnValue` | `1` | Immediately | Whether COUNT returns 0 instead of empty for NULL input |
+| `sessionPerUser` | `-1` (no limit) | Immediately | Max sessions per user |
+| `sessionConnTime` | `-1` (no limit) | Immediately | Session connection time limit (seconds) |
+| `sessionConnIdleTime` | `-1` (no limit) | Immediately | Session idle time limit (seconds) |
+| `timestampDeltaLimit` | `900` s | No | Max allowed timestamp deviation (seconds) |
+
+### Monitoring parameters
+
+| Parameter | Default | Dynamic | Description |
+|-----------|---------|---------|-------------|
+| `monitor` | `1` | Immediately | Enable metric collection and reporting to taosKeeper |
+| `monitorFqdn` | — | After restart | FQDN of the taosKeeper service |
+| `monitorPort` | `6043` | After restart | Port of the taosKeeper service |
+| `monitorInterval` | `30` s | Immediately | Interval for recording CPU/memory metrics (range 1–86400 s) |
+| `telemetryReporting` | `1` | Immediately | Upload anonymous telemetry data |
+
+### Log parameters
+
+| Parameter | Default | Dynamic | Description |
+|-----------|---------|---------|-------------|
+| `logDir` | `/var/log/taos` | No | Log file directory |
+| `minimalLogDirGB` | `1` GB | No | Stop writing logs when disk space falls below this value |
+| `numOfLogLines` | `10000000` | Immediately | Max lines per log file |
+| `asyncLog` | `1` | Immediately | Log writing mode: 0 = synchronous, 1 = asynchronous |
+| `logKeepDays` | `0` (unlimited) | Immediately | Log retention days; 0 = never rotate by age |
+| `debugFlag` | `131` or `135` | Immediately | Log verbosity: 131 = error+warn, 135 = +debug, 143 = +trace |
+| `slowLogThreshold` | `10` s | Immediately | Queries exceeding this duration are logged as slow |
+| `slowLogScope` | `QUERY` | Immediately | Slow log scope: ALL, QUERY, INSERT, OTHERS, NONE |
+
+## Log file locations
+
+By default, log files are written to `/var/log/taos`. The main taosd log file is `taosdlog`. You can change the location with the `logDir` parameter in `taos.cfg`:
+
+```text
+logDir /data/logs/taos
+```
+
+View current log settings:
+
+```sql
+SHOW DNODE 1 VARIABLES;
+```
+
+## Repair mode
+
+Use repair mode to recover corrupted vnode data without a full restart of the cluster:
+
+```bash
+taosd -r --mode force --node-type vnode \
+  --repair-target meta:vnode=3
+```
+
+Repair a single TSDB file set with an explicit strategy:
+
+```bash
+taosd -r --mode force --node-type vnode \
+  --repair-target tsdb:vnode=5:fileid=1809:strategy=head_only_rebuild
+```
+
+Repair multiple targets in one startup (with backup):
+
+```bash
+taosd -r --mode force --node-type vnode --backup-path /tmp/repair-bak \
+  --repair-target meta:vnode=3 \
+  --repair-target tsdb:vnode=5:fileid=1809 \
+  --repair-target wal:vnode=6
+```
+
+### Supported repair targets
+
+| File type | Required keys | Optional keys | Strategies |
+|-----------|--------------|---------------|------------|
+| `meta` | `vnode` | `strategy` | `from_uid`, `from_redo` |
+| `tsdb` | `vnode`, `fileid` | `strategy` | `drop_invalid_only`, `head_only_rebuild`, `full_rebuild` |
+| `wal` | `vnode` | — | — |
+
+Use `fileid=*` to repair all TSDB file sets in a vnode at once:
+
+```bash
+taosd -r --mode force --node-type vnode \
+  --repair-target 'tsdb:vnode=5:fileid=*'
+```
+
+<Warning>
+`fileid=*` and explicit `fileid=<n>` targets for the same vnode cannot be combined in a single repair invocation.
+</Warning>

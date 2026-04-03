@@ -1,0 +1,199 @@
+---
+title: "Deploy from Package"
+description: "Install TDengine TSDB on Linux or Windows using an installation package, start the service, and run your first queries."
+---
+
+You can install TDengine TSDB directly on Linux or Windows using a downloaded installation package.
+
+<Note>
+  To run TDengine in a container instead, see [Deploy with Docker](/get-started/docker).
+</Note>
+
+## Prerequisites
+
+- Your machine meets the minimum system requirements for TDengine TSDB. See [Supported Platforms](https://docs.tdengine.com/tdengine-reference/supported-platforms/) and [System Requirements](https://docs.tdengine.com/operations-and-maintenance/planning/) for details.
+- **(Windows only)** The latest [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170) is installed on your machine.
+
+## Install TDengine
+
+<Tabs>
+  <Tab title="Linux">
+    <Steps>
+      <Step title="Download the package">
+        Download the tar.gz installation package from the [TDengine Download Center](https://tdengine.com/downloads/?product=TDengine+TSDB-Enterprise). Select the **Linux-Generic** package for your architecture.
+      </Step>
+
+      <Step title="Extract the archive">
+        Navigate to the directory containing the downloaded file and extract it. For an x64 architecture:
+
+        ```bash
+        tar -zxvf tdengine-tsdb-enterprise-<version>-linux-x64.tar.gz
+        ```
+      </Step>
+
+      <Step title="Run the installer">
+        Enter the extracted subdirectory and run the install script:
+
+        ```bash
+        sudo ./install.sh
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="Windows">
+    <Steps>
+      <Step title="Download the package">
+        Download the Windows installation package from the [TDengine Download Center](https://tdengine.com/downloads/?product=TDengine+TSDB-Enterprise). Select the **Windows** package.
+      </Step>
+
+      <Step title="Run the installer">
+        Double-click the downloaded `.exe` file and follow the on-screen instructions to complete the installation.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+## Start the services
+
+All TDengine TSDB components are managed by the operating system's service manager.
+
+<CodeGroup>
+
+```bash Linux
+start-all.sh
+```
+
+```cmd Windows
+C:\TDengine\start-all.bat
+```
+
+</CodeGroup>
+
+### Verify the services are running
+
+<Tabs>
+  <Tab title="Linux">
+    Check the status of each component with `systemctl`:
+
+    ```bash
+    sudo systemctl status taosd
+    sudo systemctl status taosadapter
+    sudo systemctl status taoskeeper
+    sudo systemctl status taos-explorer
+    ```
+
+    Each service should report `Active: active (running) since ...`.
+  </Tab>
+  <Tab title="Windows">
+    Query the status of each service with `sc`:
+
+    ```cmd
+    sc query taosd
+    sc query taosadapter
+    sc query taoskeeper
+    sc query taos-explorer
+    ```
+
+    Each service should report `STATE: RUNNING`.
+  </Tab>
+</Tabs>
+
+## Connect with the taos CLI
+
+Open a terminal and run:
+
+<CodeGroup>
+
+```bash Linux / macOS
+taos
+```
+
+```cmd Windows
+taos.exe
+```
+
+</CodeGroup>
+
+When the CLI is ready, you will see the following prompt:
+
+```sql
+taos>
+```
+
+Every SQL statement must end with a semicolon (`;`).
+
+## Run your first queries
+
+### Create a database and table
+
+```sql
+CREATE DATABASE demo;
+USE demo;
+CREATE TABLE t (ts TIMESTAMP, speed INT);
+```
+
+### Insert and query data
+
+```sql
+INSERT INTO t VALUES ('2019-07-15 00:00:00', 10);
+INSERT INTO t VALUES ('2019-07-15 01:00:00', 20);
+SELECT * FROM t;
+```
+
+Expected output:
+
+```sql
+           ts            |    speed    |
+========================================
+ 2019-07-15 00:00:00.000 |          10 |
+ 2019-07-15 01:00:00.000 |          20 |
+
+Query OK, 2 row(s) in set (0.003128s)
+```
+
+## Benchmark with taosBenchmark
+
+Use `taosBenchmark` to generate 100 million sample records and test performance:
+
+```shell
+taosBenchmark -y
+```
+
+This creates a `test` database with a `meters` supertable containing 10,000 subtables, each with 10,000 records. Fields include `ts`, `current`, `voltage`, and `phase`. Tags include `location` and `groupId`.
+
+Run these queries in the taos CLI to explore the dataset:
+
+```sql
+-- Count all records in the supertable
+SELECT COUNT(*) FROM test.meters;
+
+-- Average, max, and min across all records
+SELECT AVG(current), MAX(voltage), MIN(phase) FROM test.meters;
+
+-- Filter by tag
+SELECT COUNT(*) FROM test.meters WHERE location = "California.SanFrancisco";
+
+-- Aggregate a single device in 10-second windows
+SELECT _wstart, AVG(current), MAX(voltage), MIN(phase)
+FROM test.d1001
+INTERVAL(10s);
+```
+
+<Note>
+  `_wstart` is a pseudocolumn representing the start time of each aggregation window.
+</Note>
+
+## Access TDengine Explorer
+
+TDengine TSDB Explorer is a web interface for browsing databases, running SQL queries, and exploring client library examples. Open your browser and go to:
+
+```
+http://localhost:6060
+```
+
+Log in with the default credentials: username `root`, password `taosdata`.
+
+## Next steps
+
+- [TDengine Cloud](/get-started/cloud) — use TDengine as a fully managed cloud service with no installation
+- [Deploy with Docker](/get-started/docker) — run TDengine in a container

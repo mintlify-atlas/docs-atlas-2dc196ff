@@ -1,0 +1,173 @@
+---
+title: "taos CLI"
+description: "Reference for the taos command-line interface. Covers launching taos, interactive SQL execution, import and export, special commands, and batch mode."
+---
+
+The `taos` command-line program is the primary tool for interacting with a TDengine instance. It ships with both the TDengine server and client packages.
+
+## Launching taos
+
+Connect to the local TDengine service with default settings:
+
+```bash
+taos
+```
+
+On successful connection, taos prints a welcome message and the server version, then shows the prompt:
+
+```text
+taos>
+```
+
+Connect to a remote host with a specific user:
+
+```bash
+taos -h my-server -u root -p
+```
+
+The `-p` flag without a value prompts for the password interactively. To supply it directly:
+
+```bash
+taos -h my-server -u root -ptaosdata
+```
+
+## Command-line flags
+
+### Basic flags
+
+| Flag | Description |
+|------|-------------|
+| `-h HOST` | FQDN of the TDengine server (default: localhost) |
+| `-P PORT` | Server port (default: 6030) |
+| `-u USER` | Username (default: root) |
+| `-p [PASSWORD]` | Password. Omit the value to be prompted interactively. |
+| `-d DATABASE` | Database to use after connecting |
+| `-c CONFIGDIR` | Directory containing `taos.cfg` (Linux default: `/etc/taos`) |
+| `-s "SQL"` | Execute SQL in non-interactive (batch) mode and exit |
+| `-f FILE` | Execute a SQL script file in non-interactive mode |
+| `-?, --help` | Print all command-line parameters |
+| `-V` | Print the current version number |
+
+### Advanced flags
+
+| Flag | Description |
+|------|-------------|
+| `-a AUTHSTR` | Authorization string for connecting to the server |
+| `-A` | Calculate authorization from username and password |
+| `-B` | Enable BI tool display mode (output formatted for BI tools) |
+| `-C` | Print `taos.cfg` configuration parameters and exit |
+| `-E DSN` | Connect via WebSocket DSN (cloud service or WebSocket server) |
+| `-k` | Test server status: 0=unavailable, 1=network ok, 2=service ok, 3=degraded, 4=exiting |
+| `-l PKTLEN` | Test packet size for network testing |
+| `-n NETROLE` | Network test role: `client` or `server` |
+| `-N PKTNUM` | Number of test packets |
+| `-q TOKEN` | Connect using a token (Enterprise Edition only) |
+| `-r` | Output time columns as unsigned 64-bit integers |
+| `-t` | Test server startup status (same codes as `-k`) |
+| `-w DISPLAYWIDTH` | Column display width |
+| `-z TIMEZONE` | Timezone to use (default: local timezone) |
+| `-Z 0\|1` | Connection method: 0 = native, 1 = WebSocket |
+
+## Interactive SQL execution
+
+After connecting, type any SQL statement followed by a semicolon and press Enter:
+
+```sql
+taos> SHOW DATABASES;
+taos> USE power;
+taos> SELECT * FROM meters LIMIT 5;
+```
+
+Exit the CLI:
+
+```sql
+taos> quit
+```
+
+You can also type `q` or `exit`.
+
+### Keyboard shortcuts
+
+- **Up/Down arrow**: Navigate previously entered commands
+- **Tab**: Auto-complete commands or keywords. Pressing Tab with no input lists all available commands.
+- **Ctrl+C**: Cancel a running query
+- **`\` + Tab**: Auto-complete to `\G;` (vertical output mode)
+
+## Data export
+
+Export query results to a CSV file:
+
+```sql
+SELECT * FROM power.meters WHERE ts > '2024-01-01' >> '/root/export.csv';
+```
+
+If no path is specified, the file is written to the current directory.
+
+## Data import
+
+Import data from a previously exported CSV file:
+
+```sql
+INSERT INTO power.meters FILE '/root/export.csv';
+```
+
+## Execute SQL scripts
+
+Run a file containing multiple SQL statements using the `source` command. Statements in the file can span multiple lines; each must end with a semicolon:
+
+```sql
+taos> SOURCE /root/setup.sql;
+```
+
+## Batch mode execution
+
+Use `-s` to run a SQL statement non-interactively. This mode is useful in shell scripts:
+
+```bash
+taos -h my-server -s "USE power; SHOW TABLES;"
+```
+
+Use `-f` to execute all statements in a script file non-interactively:
+
+```bash
+taos -h my-server -f /root/batch.sql
+```
+
+Each SQL statement in the file must be on its own line ending with a semicolon.
+
+## Display settings
+
+Adjust the column display width for wide string columns:
+
+```sql
+taos> SET MAX_BINARY_DISPLAY_WIDTH 256;
+```
+
+When displayed values end with `...`, the content has been truncated. Increase the display width to see the full value.
+
+## User management
+
+Change a user password from within the CLI:
+
+```sql
+taos> ALTER USER root PASS 'newpassword';
+```
+
+The default password is `taosdata`.
+
+## Other useful commands
+
+```sql
+-- Clear local schema cache
+RESET QUERY CACHE;
+
+-- Show server version
+SELECT SERVER_VERSION();
+
+-- Show current connections
+SHOW CONNECTIONS;
+```
+
+## Error codes
+
+From version 3.3.4.8, taos prints specific error codes in error messages. Consult the [TDengine documentation](https://docs.tdengine.com) for a full error code reference.

@@ -1,0 +1,397 @@
+---
+title: "Data Querying"
+description: "Query time-series data in TDengine using standard SQL, time-window aggregations, PARTITION BY, and time-series extension functions."
+---
+
+TDengine supports standard SQL queries, which significantly reduces the learning curve compared to purpose-built time-series query languages. This page walks through the query features TDengine adds on top of standard SQL, using the smart meter supertable `meters` (metrics: `current`, `voltage`, `phase`; tags: `groupid`, `location`) as the running example.
+
+To generate test data for the examples on this page, run:
+
+```bash
+taosBenchmark --start-timestamp=1600000000000 --tables=100 --records=10000000 --time-step=10000
+```
+
+This creates 100 subtables with 10 million rows each (1 billion rows total), starting at `2020-09-13T20:26:40+08:00` with a 10-second collection interval.
+
+## Basic queries
+
+Standard `SELECT` statements work exactly as you would expect from a relational database. Use `WHERE` to filter rows, `ORDER BY` to sort, and `LIMIT` to cap results:
+
+```sql
+SELECT * FROM meters
+WHERE voltage > 230
+ORDER BY ts DESC
+LIMIT 5;
+```
+
+```text
+          ts            |  current   | voltage |    phase    | groupid |          location        |
+===================================================================================================
+2023-11-15 06:13:10.000 | 14.0601978 |     232 | 146.5000000 |      10 | California.Sunnyvale     |
+2023-11-15 06:13:10.000 | 14.0601978 |     232 | 146.5000000 |       1 | California.LosAngles     |
+2023-11-15 06:13:10.000 | 14.0601978 |     232 | 146.5000000 |      10 | California.Sunnyvale     |
+2023-11-15 06:13:10.000 | 14.0601978 |     232 | 146.5000000 |       5 | California.Cupertino     |
+2023-11-15 06:13:10.000 | 14.0601978 |     232 | 146.5000000 |       4 | California.SanFrancisco  |
+Query OK, 5 row(s) in set (0.145403s)
+```
+
+## Aggregate queries
+
+Use `GROUP BY` to compute aggregates per group. You can group by any column in the supertable, including tag columns:
+
+```sql
+SELECT groupid, avg(voltage)
+FROM meters
+WHERE ts >= "2022-01-01T00:00:00+08:00"
+  AND ts <  "2023-01-01T00:00:00+08:00"
+GROUP BY groupid;
+```
+
+```text
+ groupid   |   avg(voltage)        |
+======================================
+         8 |   243.961981544901079 |
+         5 |   243.961981544901079 |
+         1 |   243.961981544901079 |
+...
+Query OK, 10 row(s) in set (0.042446s)
+```
+
+<Note>
+`GROUP BY` does not guarantee output order. Add `ORDER BY` if you need a specific sequence.
+</Note>
+
+### Built-in aggregation functions
+
+| Function       | Description                                                                  |
+|:--------------:|:----------------------------------------------------------------------------:|
+| `AVG`          | Average value of a column                                                    |
+| `COUNT`        | Number of non-null records                                                   |
+| `SUM`          | Sum of a column                                                              |
+| `STDDEV`       | Standard deviation of a column                                               |
+| `SPREAD`       | Difference between max and min values in a column                            |
+| `PERCENTILE`   | Exact percentile of a column                                                 |
+| `APERCENTILE`  | Approximate percentile (lower memory usage)                                  |
+| `HISTOGRAM`    | Distribution of data across user-defined intervals                           |
+| `HYPERLOGLOG`  | Estimated cardinality using the HyperLogLog algorithm                        |
+| `LEASTSQUARES` | Fitted line equation for a column (linear regression)                        |
+| `ELAPSED`      | Total time duration covered by data in a given period                        |
+
+## Data partitioning with PARTITION BY
+
+`PARTITION BY` divides the dataset into independent slices before applying aggregations or window operations. It is placed after the `WHERE` clause and accepts any scalar expression — columns, constants, or functions:
+
+```sql
+SELECT location, avg(voltage)
+FROM meters
+PARTITION BY location;
+```
+
+```text
+          location          |     avg(voltage)      |
+======================================================
+ California.SantaClara      |   243.962050000000005 |
+ California.SanFrancisco    |   243.962050000000005 |
+ California.SanJose         |   243.962050000000005 |
+ California.LosAngles       |   243.962050000000005 |
+ California.SanDiego        |   243.962050000000005 |
+...
+Query OK, 10 row(s) in set (2.415961s)
+```
+
+`PARTITION BY` is especially useful in combination with window clauses: each partition gets its own independent set of windows.
+
+## Window queries
+
+Window queries aggregate data across time-based or condition-based windows. TDengine supports five window types:
+
+<CardGroup cols={2}>
+  <Card title="Time window" icon="clock">
+    Fixed time intervals. Supports tumbling (non-overlapping) and sliding (overlapping) variants.
+  </Card>
+  <Card title="State window" icon="toggle-on">
+    Windows defined by a device state value. A new window opens whenever the state changes.
+  </Card>
+  <Card title="Session window" icon="link">
+    Windows defined by gaps between consecutive timestamps. Records within the gap threshold belong to the same session.
+  </Card>
+  <Card title="Event window" icon="flag">
+    Windows defined by explicit start and end conditions on column values.
+  </Card>
+  <Card title="Count window" icon="list-ol">
+    Windows defined by a fixed number of data rows rather than a time range.
+  </Card>
+  <Card title="External window" icon="table-columns">
+    Windows defined by a subquery, allowing sophisticated aggregation against explicitly specified time ranges.
+  </Card>
+</CardGroup>
+
+<Note>
+The window clause cannot be used together with `GROUP BY`. Window queries can only reference constants, aggregate functions, and the pseudocolumns `_wstart`, `_wend`, and `_wduration` in the `SELECT` list.
+</Note>
+
+### Window pseudocolumns
+
+| Pseudocolumn  | Description                              |
+|:-------------:|:----------------------------------------:|
+| `_wstart`     | Start time of the window (inclusive)     |
+| `_wend`       | End time of the window (exclusive for INTERVAL; inclusive for others) |
+| `_wduration`  | Duration of the window in the database's time unit |
+| `_qstart`     | Start time of the overall query range    |
+| `_qend`       | End time of the overall query range      |
+
+### Time windows
+
+The `INTERVAL` clause creates fixed-size time windows. `SLIDING` controls how far each window advances; when `SLIDING` equals `INTERVAL`, windows do not overlap (tumbling).
+
+**Syntax:**
+
+```sql
+INTERVAL(interval_val [, interval_offset])
+[SLIDING(sliding_val)]
+[FILL(fill_method)]
+```
+
+Time units: `a` (milliseconds), `s` (seconds), `m` (minutes), `h` (hours), `d` (days), `w` (weeks), `n` (months), `y` (years).
+
+<Tabs>
+  <Tab title="Tumbling window">
+    Each minute of data goes into exactly one window (no overlap):
+
+    ```sql
+    SELECT tbname, _wstart, _wend, avg(voltage)
+    FROM meters
+    WHERE ts >= "2022-01-01T00:00:00+08:00"
+      AND ts <  "2022-01-01T00:05:00+08:00"
+    PARTITION BY tbname
+    INTERVAL(1m) SLIDING(1m)
+    SLIMIT 1;
+    ```
+
+    ```text
+     tbname |         _wstart         |          _wend          |     avg(voltage)      |
+    ======================================================================================
+     d2     | 2022-01-01 00:00:00.000 | 2022-01-01 00:01:00.000 |   246.000000000000000 |
+     d2     | 2022-01-01 00:01:00.000 | 2022-01-01 00:02:00.000 |   240.833333333333343 |
+     d2     | 2022-01-01 00:02:00.000 | 2022-01-01 00:03:00.000 |   243.833333333333343 |
+     d2     | 2022-01-01 00:03:00.000 | 2022-01-01 00:04:00.000 |   241.333333333333343 |
+     d2     | 2022-01-01 00:04:00.000 | 2022-01-01 00:05:00.000 |   244.166666666666657 |
+    Query OK, 5 row(s) in set (0.016812s)
+    ```
+  </Tab>
+  <Tab title="Sliding window">
+    Windows overlap: a 1-minute window slides every 30 seconds, so each data point can appear in two windows:
+
+    ```sql
+    SELECT tbname, _wstart, avg(voltage)
+    FROM meters
+    WHERE ts >= "2022-01-01T00:00:00+08:00"
+      AND ts <  "2022-01-01T00:05:00+08:00"
+    PARTITION BY tbname
+    INTERVAL(1m) SLIDING(30s)
+    SLIMIT 1;
+    ```
+
+    ```text
+     tbname |         _wstart         |     avg(voltage)      |
+    =============================================================
+     d2     | 2021-12-31 23:59:30.000 |   248.333333333333343 |
+     d2     | 2022-01-01 00:00:00.000 |   246.000000000000000 |
+     d2     | 2022-01-01 00:00:30.000 |   244.666666666666657 |
+    ...
+    Query OK, 11 row(s) in set (0.013153s)
+    ```
+  </Tab>
+  <Tab title="With FILL">
+    Fill missing windows with the previous non-NULL value:
+
+    ```sql
+    SELECT tbname, _wstart, _wend, avg(voltage)
+    FROM meters
+    WHERE ts >= "2022-01-01T00:00:00+08:00"
+      AND ts <  "2022-01-01T00:05:00+08:00"
+    PARTITION BY tbname
+    INTERVAL(1m) FILL(prev)
+    SLIMIT 2;
+    ```
+
+    Other fill modes: `FILL(NULL)`, `FILL(VALUE, n)`, `FILL(LINEAR)`, `FILL(next)`.
+  </Tab>
+  <Tab title="With offset">
+    Shift window boundaries by 5 seconds from the default alignment:
+
+    ```sql
+    SELECT tbname, _wstart, _wend, avg(voltage)
+    FROM meters
+    WHERE ts >= "2022-01-01T00:00:00+08:00"
+      AND ts <  "2022-01-01T00:05:00+08:00"
+    PARTITION BY tbname
+    INTERVAL(1m, 5s)
+    SLIMIT 2;
+    ```
+  </Tab>
+</Tabs>
+
+### State windows
+
+State windows group consecutive rows that share the same state value. A new window opens when the value changes. You can use a `CASE` expression to define the state:
+
+```sql
+SELECT tbname, _wstart, _wend, _wduration,
+       CASE WHEN voltage >= 225 AND voltage <= 235 THEN 1 ELSE 0 END AS status
+FROM meters
+WHERE ts >= "2022-01-01T00:00:00+08:00"
+  AND ts <  "2022-01-01T00:05:00+08:00"
+PARTITION BY tbname
+STATE_WINDOW(
+    CASE WHEN voltage >= 225 AND voltage <= 235 THEN 1 ELSE 0 END
+)
+SLIMIT 2;
+```
+
+```text
+ tbname |         _wstart         |          _wend          |  _wduration   |    status     |
+===============================================================================================
+ d2     | 2022-01-01 00:00:00.000 | 2022-01-01 00:01:20.000 |         80000 |             0 |
+ d2     | 2022-01-01 00:01:30.000 | 2022-01-01 00:01:30.000 |             0 |             1 |
+ d2     | 2022-01-01 00:01:40.000 | 2022-01-01 00:01:40.000 |             0 |             0 |
+...
+Query OK, 22 row(s) in set (0.153403s)
+```
+
+### Session windows
+
+Session windows group records whose timestamps fall within a given tolerance of each other. When consecutive timestamps are farther apart than `tol_val`, a new session starts:
+
+```sql
+SELECT tbname, _wstart, _wend, _wduration, count(*)
+FROM meters
+WHERE ts >= "2022-01-01T00:00:00+08:00"
+  AND ts <  "2022-01-01T00:10:00+08:00"
+PARTITION BY tbname
+SESSION(ts, 10m)
+SLIMIT 10;
+```
+
+```text
+ tbname |         _wstart         |          _wend          |  _wduration   |   count(*)    |
+===============================================================================================
+ d2     | 2022-01-01 00:00:00.000 | 2022-01-01 00:09:50.000 |        590000 |            60 |
+ d26    | 2022-01-01 00:00:00.000 | 2022-01-01 00:09:50.000 |        590000 |            60 |
+...
+Query OK, 10 row(s) in set (0.043489s)
+```
+
+Because all 60 readings within the 10-minute range are spaced 10 seconds apart (well within the 10-minute tolerance), each subtable forms a single session.
+
+### Event windows
+
+Event windows open when a `START WITH` condition is met and close when an `END WITH` condition is met:
+
+```sql
+SELECT tbname, _wstart, _wend, _wduration, count(*)
+FROM meters
+WHERE ts >= "2022-01-01T00:00:00+08:00"
+  AND ts <  "2022-01-01T00:10:00+08:00"
+PARTITION BY tbname
+EVENT_WINDOW START WITH voltage >= 225 END WITH voltage < 235
+LIMIT 5;
+```
+
+```text
+ tbname |         _wstart         |          _wend          |  _wduration   |   count(*)    |
+==============================================================================================
+ d0     | 2022-01-01 00:00:00.000 | 2022-01-01 00:01:30.000 |         90000 |            10 |
+ d0     | 2022-01-01 00:01:40.000 | 2022-01-01 00:02:30.000 |         50000 |             6 |
+ d0     | 2022-01-01 00:02:40.000 | 2022-01-01 00:03:10.000 |         30000 |             4 |
+...
+Query OK, 500 row(s) in set (0.328557s)
+```
+
+A window that cannot be closed (no row ever satisfies `END WITH`) is discarded and not included in results.
+
+### Count windows
+
+Count windows divide data into groups of a fixed number of rows rather than by time:
+
+```sql
+SELECT _wstart, _wend, count(*)
+FROM meters
+WHERE ts >= "2022-01-01T00:00:00+08:00"
+  AND ts <  "2022-01-01T00:30:00+08:00"
+COUNT_WINDOW(1000);
+```
+
+```text
+         _wstart         |          _wend          |   count(*)    |
+=====================================================================
+ 2022-01-01 00:00:00.000 | 2022-01-01 00:01:30.000 |          1000 |
+ 2022-01-01 00:01:40.000 | 2022-01-01 00:03:10.000 |          1000 |
+ 2022-01-01 00:03:20.000 | 2022-01-01 00:04:50.000 |          1000 |
+...
+Query OK, 10 row(s) in set (0.062794s)
+```
+
+## SLIMIT and SOFFSET
+
+`SLIMIT` and `SOFFSET` apply to partitions (subtables), not to rows. In the examples above, `SLIMIT 2` returns results for the first 2 subtables only, regardless of how many rows each subtable contributes. Use `SOFFSET` to skip partitions for pagination.
+
+## Time-series extension functions
+
+TDengine provides built-in functions that would require complex subqueries or be inefficient in a general-purpose database:
+
+| Function        | Description                                                                 |
+|:---------------:|:---------------------------------------------------------------------------:|
+| `TWA`           | Time-weighted average over a period                                         |
+| `DERIVATIVE`    | Rate of change per unit of time                                             |
+| `DIFF`          | Difference between consecutive row values                                   |
+| `CSUM`          | Cumulative sum, ignoring NULL values                                        |
+| `MAVG`          | Moving average over the last k values                                       |
+| `IRATE`         | Instantaneous growth rate using the last two samples                        |
+| `STATECOUNT`    | Count of consecutive rows meeting a condition                               |
+| `STATEDURATION` | Duration of consecutive rows meeting a condition                            |
+
+### Example: energy consumption via time-weighted average
+
+To compute daily energy consumption (voltage × current integrated over time):
+
+```sql
+SELECT twa(voltage * current) * _wduration
+FROM meters
+PARTITION BY tbname
+INTERVAL(1d);
+```
+
+## Nested queries
+
+TDengine supports non-correlated subqueries in the `FROM` clause. The inner query result acts as a virtual table for the outer query:
+
+```sql
+SELECT max(voltage), *
+FROM (
+    SELECT tbname, last_row(ts), voltage, current, phase, groupid, location
+    FROM meters
+    PARTITION BY tbname
+)
+GROUP BY groupid;
+```
+
+The inner query retrieves the most recent row per subtable. The outer query then finds the subtable with the highest voltage within each group.
+
+<Note>
+Functions that depend on an ordered timeline (such as `DERIVATIVE`, `IRATE`, `TWA`, `DIFF`) require the inner query to produce timestamps in ascending order. The `ORDER BY` clause inside a subquery is generally redundant and best avoided.
+</Note>
+
+## UNION ALL
+
+Combine result sets from multiple `SELECT` statements with `UNION ALL`. All `SELECT` clauses must return the same number of columns in compatible types:
+
+```sql
+(SELECT tbname, * FROM d1  LIMIT 1)
+UNION ALL
+(SELECT tbname, * FROM d11 LIMIT 2)
+UNION ALL
+(SELECT tbname, * FROM d21 LIMIT 3);
+```
+
+TDengine supports up to 100 `UNION` clauses in a single statement.

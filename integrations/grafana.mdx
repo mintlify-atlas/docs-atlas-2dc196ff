@@ -1,0 +1,254 @@
+---
+title: "Grafana"
+description: "How to integrate TDengine with Grafana: install the datasource plugin, configure the connection, write SQL queries in panels, import the TDinsight dashboard, and use template variables."
+---
+
+TDengine provides a Grafana datasource plugin that lets you query and visualize time-series data from TDengine directly in Grafana dashboards without writing custom code. Grafana 8.0 and later are supported; the latest version is recommended.
+
+## Prerequisites
+
+- Grafana is deployed and running. The account starting Grafana must have write access to its installation directory (required for plugin installation).
+- A TDengine cluster is deployed and running.
+- taosAdapter is installed and running.
+- Record the TDengine REST API address (e.g., `http://tdengine.local:6041`) and your TDengine username and password.
+
+## Installing the plugin
+
+<Tabs>
+  <Tab title="Installation script">
+    Run the installation script on the Grafana server. It installs the plugin and adds a provisioning configuration file:
+
+    ```bash
+    bash -c "$(curl -fsSL \
+      https://raw.githubusercontent.com/taosdata/grafanaplugin/master/install.sh)" -- \
+      -a http://localhost:6041 \
+      -u root \
+      -p taosdata
+    ```
+
+    Restart Grafana after installation:
+
+    ```bash
+    systemctl restart grafana-server
+    ```
+  </Tab>
+  <Tab title="grafana-cli">
+    ```bash
+    grafana-cli --pluginUrl \
+      https://www.tdengine.com/assets-download/grafana-plugin/tdengine-datasource.zip \
+      plugins install tdengine-datasource
+    ```
+
+    With sudo:
+
+    ```bash
+    sudo -u grafana grafana-cli --pluginUrl \
+      https://www.tdengine.com/assets-download/grafana-plugin/tdengine-datasource.zip \
+      plugins install tdengine-datasource
+    ```
+
+    Restart Grafana after installation.
+  </Tab>
+  <Tab title="Manual">
+    ```bash
+    wget https://www.tdengine.com/assets-download/grafana-plugin/tdengine-datasource.zip
+    sudo unzip tdengine-datasource.zip -d /var/lib/grafana/plugins/
+    ```
+
+    Restart Grafana after extracting the plugin.
+  </Tab>
+  <Tab title="Docker">
+    Pass the plugin URL via `GF_INSTALL_PLUGINS`:
+
+    ```bash
+    docker run -d \
+      -p 3000:3000 \
+      --name=grafana \
+      -e "GF_INSTALL_PLUGINS=https://www.tdengine.com/assets-download/grafana-plugin/tdengine-datasource.zip;tdengine-datasource" \
+      grafana/grafana
+    ```
+  </Tab>
+</Tabs>
+
+## Configuring the datasource
+
+<Steps>
+  <Step title="Open datasource settings">
+    Navigate to **Configuration → Data Sources** in Grafana and click **Add data source**.
+  </Step>
+  <Step title="Select TDengine">
+    Type `TDengine` in the search box, then click **Select**.
+  </Step>
+  <Step title="Enter connection details">
+    Fill in the following fields:
+
+    | Field | Example value |
+    |-------|---------------|
+    | Host | `http://localhost:6041` |
+    | User | `root` |
+    | Password | `taosdata` |
+  </Step>
+  <Step title="Test the connection">
+    Click **Save & Test**. A successful test shows: `TDengine Data source is working`.
+  </Step>
+</Steps>
+
+<Note>
+The REST interface is stateless. You cannot use `USE db` to switch databases. Always qualify table names with the database: `db_name.table_name`.
+</Note>
+
+## Writing queries in panels
+
+The TDengine plugin uses Grafana's built-in variables and supports TDengine's time-series SQL extensions.
+
+### Built-in Grafana variables
+
+| Variable | Meaning |
+|----------|---------|
+| `$from` | Dashboard time range start |
+| `$to` | Dashboard time range end |
+| `$interval` | Window interval calculated from time range and panel width |
+
+Always include a time filter in your queries to avoid full table scans:
+
+```sql
+SELECT _wstart AS ts, AVG(current) AS current
+FROM power.meters
+WHERE ts > $from AND ts < $to
+INTERVAL($interval) FILL(NULL)
+```
+
+### Time-series aggregation
+
+Use `_wstart` and `_wend` pseudo-columns to return the window timestamp in your result set:
+
+```sql
+SELECT _wstart AS ts, AVG(current) AS current
+FROM power.meters
+WHERE groupid IN ($selected_groups) AND ts > $from AND ts < $to
+INTERVAL($interval) FILL(NULL)
+```
+
+Set **INPUT SQL** to this query in the panel editor. Use **ALIAS BY** to name the series. Click **GENERATE SQL** to preview the final query with variables substituted.
+
+### Grouping by tags
+
+Use `PARTITION BY` to split results by a tag and display multiple series on one panel:
+
+```sql
+SELECT _wstart AS ts, groupid, AVG(current) AS current
+FROM power.meters
+WHERE ts > $from AND ts < $to
+PARTITION BY groupid
+INTERVAL($interval) FILL(NULL)
+```
+
+In the panel editor:
+- **Group by column(s)**: `groupid`
+- **Group By Format**: `groupid-{{groupid}}`
+
+The legend will show `groupid-1`, `groupid-2`, etc.
+
+## Template variables
+
+Template variables make dashboards interactive. Add them under **Dashboard Settings → Variables**.
+
+### Query variable (tag values)
+
+1. Set **Name** to `selected_groups`.
+2. Set **Variable type** to `Query`.
+3. Set **Data source** to your TDengine source.
+4. Enter the SQL:
+
+   ```sql
+   SELECT DISTINCT(groupid) FROM power.meters
+   WHERE groupid < 10 AND ts > $from AND ts < $to;
+   ```
+
+5. Click **Run Query** to preview values, then **Apply** and **Save dashboard**.
+
+Reference the variable in queries as `$selected_groups`.
+
+### Chaining variables
+
+One variable can reference another:
+
+```sql
+SELECT tbname FROM power.meters
+WHERE groupid = $selected_groups AND ts > $from AND ts < $to;
+```
+
+### Custom interval variable
+
+1. Set **Name** to `interval`.
+2. Set **Variable type** to `Interval`.
+3. Set **Interval options** to `1s,2s,5s,10s,15s,30s,1m`.
+
+Reference as `$interval` in `INTERVAL($interval)`.
+
+## Performance recommendations
+
+- **Always include a time range** in every query. Queries without a time filter cause full table scans.
+- **Enable last-row caching** when querying the latest state: create your database with `CACHEMODEL 'last_row'` or `'both'`, then use `LAST(column)` instead of `MAX` or subqueries.
+
+  ```sql
+  SELECT LAST(current) FROM power.meters WHERE ts > $from AND ts < $to;
+  ```
+
+## TDinsight dashboard
+
+TDinsight is the official monitoring dashboard for TDengine clusters. It requires taosKeeper to be running.
+
+<Steps>
+  <Step title="Open the import dialog">
+    In Grafana, go to **Dashboards → Import**. You can also click **Import TDinsight** directly from the datasource configuration page.
+  </Step>
+  <Step title="Load by dashboard ID">
+    Enter dashboard ID **18587** (`TaosKeeper Prometheus Dashboard for 3.x`) and click **Load**.
+  </Step>
+  <Step title="Select datasource and import">
+    Choose your TDengine datasource, then click **Import**.
+  </Step>
+</Steps>
+
+The TDinsight dashboard shows cluster uptime, database and table counts, per-dnode CPU, memory, disk, network, and I/O metrics, taosAdapter request rates, and slow query statistics.
+
+### Other available dashboards
+
+| Dashboard ID | Description |
+|-------------|-------------|
+| [15146](https://grafana.com/grafana/dashboards/15146) | Monitor multiple TDengine clusters |
+| [15155](https://grafana.com/grafana/dashboards/15155) | TDengine alert example |
+| [15167](https://grafana.com/grafana/dashboards/15167) | TDinsight (TDengine 2.x) |
+| [16388](https://grafana.com/grafana/dashboards/16388) | Node information collected by Telegraf |
+
+## Alert configuration
+
+The TDengine Grafana plugin supports Grafana's native alerting. To configure alerts:
+
+<Steps>
+  <Step title="Configure a contact point">
+    Go to **Alerting → Contact points** and add a channel (email, Slack, DingTalk, PagerDuty, etc.).
+  </Step>
+  <Step title="Configure a notification policy">
+    In **Notification policies**, set routing rules, group wait times, and repeat intervals.
+  </Step>
+  <Step title="Create an alert rule">
+    In the panel you want to alert on, go to **Edit → Alert → New alert rule**.
+
+    Example query for alerting when average current exceeds 100:
+
+    ```sql
+    SELECT _wstart AS ts, groupid, AVG(current) AS current
+    FROM power.meters
+    WHERE ts > $from AND ts < $to
+    PARTITION BY groupid
+    INTERVAL($interval) FILL(NULL)
+    ```
+
+    Add a **Threshold** expression: `is above 100`. Click **Set as alert condition**.
+  </Step>
+  <Step title="Set evaluation strategy">
+    Assign the alert to a folder and evaluation group. Set a **Pending period** to avoid false alarms from transient spikes.
+  </Step>
+</Steps>

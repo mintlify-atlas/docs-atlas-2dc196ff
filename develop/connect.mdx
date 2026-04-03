@@ -1,0 +1,517 @@
+---
+title: "Connecting to TDengine"
+description: "How to connect your application to TDengine using native or WebSocket connections, with examples in Java, Python, Go, Rust, Node.js, C#, and C."
+---
+
+TDengine connectors support two connection methods: **WebSocket** (recommended) over port `6041` via taosAdapter, and **native** connections over port `6030` using the taosc client driver. Most language connectors support both modes; Node.js supports WebSocket only.
+
+<Note>
+WebSocket connections are recommended for all new applications. They require no client driver installation and support failover across multiple taosAdapter endpoints.
+</Note>
+
+## Connection methods
+
+<CardGroup cols={2}>
+  <Card title="WebSocket (recommended)" icon="globe">
+    Connects to taosAdapter on port `6041`. No client driver required. Supports connection failover, compression, and cloud tokens. Available in all language connectors.
+  </Card>
+  <Card title="Native connection" icon="server">
+    Connects directly to taosd on port `6030` using the taosc shared library. Lowest latency, but requires the client driver to be installed and matched to the server version.
+  </Card>
+</CardGroup>
+
+## Installing the client driver (native connections only)
+
+Skip this section if you are using WebSocket connections.
+
+<Tabs>
+  <Tab title="Linux">
+    Download and install the TDengine client package for your Linux distribution from the TDengine release page. The package installs `libtaos.so` and the `taos` CLI tool.
+
+    ```bash
+    # Verify the installation
+    taos -h localhost -u root -p
+    ```
+  </Tab>
+  <Tab title="Windows">
+    Download and run the Windows client installer. After installation, `taos.dll` is placed in the system path.
+
+    ```bash
+    taos -h localhost -u root -p
+    ```
+  </Tab>
+  <Tab title="macOS">
+    Download and install the macOS client package. After installation, verify with:
+
+    ```bash
+    taos -h localhost -u root -p
+    ```
+  </Tab>
+</Tabs>
+
+## Installing connectors
+
+<Tabs>
+  <Tab title="Java">
+    Add the JDBC driver to your Maven `pom.xml`:
+
+    ```xml
+    <dependency>
+      <groupId>com.taosdata.jdbc</groupId>
+      <artifactId>taos-jdbcdriver</artifactId>
+      <version>3.8.2</version>
+    </dependency>
+    ```
+  </Tab>
+  <Tab title="Python">
+    Install the WebSocket connector:
+
+    ```bash
+    pip3 install taos-ws-py
+    ```
+
+    Install the native connector:
+
+    ```bash
+    pip3 install taospy
+    ```
+
+    Install both at once:
+
+    ```bash
+    pip3 install taospy[ws]
+    ```
+  </Tab>
+  <Tab title="Go">
+    Add the driver to your `go.mod`:
+
+    ```go
+    module myapp
+
+    go 1.17
+
+    require github.com/taosdata/driver-go/v3 latest
+    ```
+
+    <Note>
+    The native Go driver uses cgo and requires GCC to compile. Make sure GCC is installed on your system.
+    </Note>
+  </Tab>
+  <Tab title="Rust">
+    Add the `taos` crate to `Cargo.toml`:
+
+    ```toml
+    [dependencies]
+    taos = { version = "*" }
+    ```
+
+    For WebSocket-only builds:
+
+    ```toml
+    [dependencies]
+    taos = { version = "*", default-features = false, features = ["ws"] }
+    ```
+  </Tab>
+  <Tab title="Node.js">
+    ```bash
+    npm install @tdengine/websocket
+    ```
+
+    <Note>
+    Node.js currently supports WebSocket connections only.
+    </Note>
+  </Tab>
+  <Tab title="C#">
+    Add the NuGet package to your project:
+
+    ```xml
+    <PackageReference Include="TDengine.Connector" Version="3.2.0" />
+    ```
+
+    Or via the CLI:
+
+    ```bash
+    dotnet add package TDengine.Connector
+    ```
+  </Tab>
+  <Tab title="C">
+    The C connector is included with the TDengine server or client package. No additional installation is needed.
+  </Tab>
+</Tabs>
+
+## Connection string format
+
+### Java JDBC URL
+
+```text
+jdbc:[TAOS|TAOS-WS]://[host]:[port]/[database]?user={user}&password={password}&charset={charset}&timezone={timezone}
+```
+
+- Use `TAOS-WS` for WebSocket, `TAOS` for native connections.
+- Default port: `6041` (WebSocket), `6030` (native).
+
+### Go DSN
+
+```text
+username:password@protocol(address)/dbname?param=value
+```
+
+WebSocket example:
+
+```text
+root:taosdata@ws(localhost:6041)/testdb
+```
+
+Multi-endpoint failover (supported for `taosWS` and `ws/unified`):
+
+```text
+root:taosdata@ws(localhost:6041,localhost:6042)/testdb
+```
+
+IPv6 addresses must be enclosed in square brackets:
+
+```text
+root:taosdata@ws([::1]:6041)/testdb
+```
+
+### Rust DSN
+
+```text
+<driver>[+<protocol>]://[[<username>:<password>@]<host>:<port>][/<database>][?<p1>=<v1>]
+```
+
+### Node.js DSN
+
+```text
+ws://username:password@host:port/database
+```
+
+### C# connection string
+
+```text
+protocol=WebSocket;host=127.0.0.1;port=6041;username=root;password=taosdata
+```
+
+Multi-endpoint failover (version 3.2.0+):
+
+```text
+protocol=WebSocket;host=adapter-a:6041,adapter-b:6041;username=root;password=taosdata;autoReconnect=true;reconnectRetryCount=3;reconnectIntervalMs=2000
+```
+
+## WebSocket connection examples
+
+<CodeGroup>
+
+```java WSConnectExample.java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.util.Properties;
+
+public class WSConnectExample {
+    public static void main(String[] args) throws Exception {
+        String url = "jdbc:TAOS-WS://localhost:6041/";
+        Properties props = new Properties();
+        props.setProperty("user", "root");
+        props.setProperty("password", "taosdata");
+
+        try (Connection conn = DriverManager.getConnection(url, props)) {
+            System.out.println("Connected to TDengine via WebSocket.");
+        }
+    }
+}
+```
+
+```python connect_websocket_examples.py
+import taosws
+
+def create_connection():
+    conn = None
+    host = "localhost"
+    port = 6041
+    try:
+        conn = taosws.connect(
+            user="root",
+            password="taosdata",
+            host=host,
+            port=port,
+        )
+        print(f"Connected to {host}:{port} successfully.")
+    except Exception as err:
+        print(f"Failed to connect to {host}:{port}, ErrMessage:{err}")
+        raise err
+    return conn
+```
+
+```go wsexample/main.go
+package main
+
+import (
+    "database/sql"
+    "fmt"
+    "log"
+
+    _ "github.com/taosdata/driver-go/v3/taosWS"
+)
+
+func main() {
+    var taosDSN = "root:taosdata@ws(localhost:6041)/"
+    taos, err := sql.Open("taosWS", taosDSN)
+    if err != nil {
+        log.Fatalln("Failed to connect to " + taosDSN + "; ErrMessage: " + err.Error())
+    }
+    fmt.Println("Connected to " + taosDSN + " successfully.")
+    defer taos.Close()
+}
+```
+
+```rust connect.rs
+use taos::*;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let dsn = "ws://root:taosdata@localhost:6041";
+    let builder = TaosBuilder::from_dsn(dsn)?;
+    let taos = builder.build().await?;
+    println!("Connected successfully.");
+    Ok(())
+}
+```
+
+```javascript sql_example.js
+const taosws = require("@tdengine/websocket");
+
+let conf = new taosws.WSConfig("ws://root:taosdata@localhost:6041");
+conf.setUser("root");
+conf.setPwd("taosdata");
+conf.setDb("");
+
+taosws.sqlConnect(conf).then((conn) => {
+    console.log("Connected to TDengine via WebSocket.");
+    conn.close();
+}).catch((err) => {
+    console.error("Failed to connect:", err);
+});
+```
+
+```csharp wsConnect/Program.cs
+using TDengine.Driver;
+using TDengine.Driver.Client;
+
+var builder = new ConnectionStringBuilder(
+    "protocol=WebSocket;host=localhost;port=6041;username=root;password=taosdata");
+
+using var client = DbDriver.Open(builder);
+Console.WriteLine("Connected to TDengine via WebSocket.");
+```
+
+```c connect_example.c
+#include "taos.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+int main() {
+    // Set WebSocket driver before connecting
+    taos_options(TSDB_OPTION_DRIVER, "websocket");
+
+    TAOS *taos = taos_connect("localhost", "root", "taosdata", NULL, 6041);
+    if (taos == NULL) {
+        fprintf(stderr, "Failed to connect: %s\n", taos_errstr(NULL));
+        taos_cleanup();
+        return EXIT_FAILURE;
+    }
+    printf("Connected to TDengine via WebSocket.\n");
+    taos_close(taos);
+    taos_cleanup();
+    return 0;
+}
+```
+
+</CodeGroup>
+
+## Native connection examples
+
+<Warning>
+Native connections for Go, C#, and Java are deprecated with end-of-life on 2027-01-01. Use WebSocket connections for all new development.
+</Warning>
+
+<CodeGroup>
+
+```java JNIConnectExample.java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.util.Properties;
+
+public class JNIConnectExample {
+    public static void main(String[] args) throws Exception {
+        String url = "jdbc:TAOS://localhost:6030/";
+        Properties props = new Properties();
+        props.setProperty("user", "root");
+        props.setProperty("password", "taosdata");
+
+        try (Connection conn = DriverManager.getConnection(url, props)) {
+            System.out.println("Connected to TDengine via native connection.");
+        }
+    }
+}
+```
+
+```go cgoexample/main.go
+package main
+
+import (
+    "database/sql"
+    "fmt"
+    "log"
+
+    _ "github.com/taosdata/driver-go/v3/taosSql"
+)
+
+func main() {
+    var taosDSN = "root:taosdata@tcp(localhost:6030)/"
+    taos, err := sql.Open("taosSql", taosDSN)
+    if err != nil {
+        log.Fatalln("failed to connect TDengine, err:", err)
+    }
+    fmt.Println("Connected via native connection.")
+    defer taos.Close()
+}
+```
+
+```c connect_example.c
+#include "taos.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+int main() {
+    TAOS *taos = taos_connect("localhost", "root", "taosdata", NULL, 6030);
+    if (taos == NULL) {
+        fprintf(stderr, "Failed to connect: ErrCode: 0x%x, ErrMessage: %s\n",
+                taos_errno(NULL), taos_errstr(NULL));
+        taos_cleanup();
+        return EXIT_FAILURE;
+    }
+    printf("Connected to TDengine via native connection.\n");
+    taos_close(taos);
+    taos_cleanup();
+    return 0;
+}
+```
+
+</CodeGroup>
+
+## Connection parameters reference
+
+### Python `taosws.connect()`
+
+| Parameter  | Default                    | Description                              |
+| ---------- | -------------------------- | ---------------------------------------- |
+| `host`     | `localhost`                | taosAdapter host                         |
+| `port`     | `6041`                     | taosAdapter port                         |
+| `user`     | `root`                     | TDengine username                        |
+| `password` | `taosdata`                 | TDengine password                        |
+| `database` | _(none)_                   | Default database                         |
+| `timeout`  | socket default             | HTTP request timeout in seconds          |
+
+### Go WebSocket DSN parameters
+
+| Parameter              | Default          | Description                                             |
+| ---------------------- | ---------------- | ------------------------------------------------------- |
+| `enableCompression`    | `false`          | Send compressed data                                    |
+| `readTimeout`          | `5m`             | Timeout for reading data                                |
+| `writeTimeout`         | `10s`            | Timeout for writing data                                |
+| `timezone`             | system timezone  | IANA timezone for SQL parsing and result conversion     |
+| `autoReconnect`        | `false`          | Enable automatic reconnect after disconnect (v3.8.0+)   |
+| `reconnectIntervalMs`  | `2000`           | Reconnect interval in milliseconds                      |
+| `reconnectRetryCount`  | `3`              | Number of reconnect attempts                            |
+
+### C# connection string parameters
+
+| Parameter            | Default     | Description                                                  |
+| -------------------- | ----------- | ------------------------------------------------------------ |
+| `protocol`           | `Native`    | `Native` or `WebSocket`                                      |
+| `host`               | _(required)_| Single address or comma-separated list (WebSocket, v3.2.0+)  |
+| `port`               | `6041`/`6030`| Port; `6041` default for WebSocket, `6030` for native       |
+| `username`           | _(required)_| TDengine username                                            |
+| `password`           | _(required)_| TDengine password                                            |
+| `autoReconnect`      | `false`     | Automatically reconnect on disconnect                        |
+| `reconnectRetryCount`| `3`         | Number of reconnect rounds                                   |
+| `reconnectIntervalMs`| `2000`      | Interval between reconnect rounds in milliseconds            |
+| `useSSL`             | `false`     | Use TLS for WebSocket connection                             |
+| `enableCompression`  | `false`     | Enable WebSocket compression                                 |
+
+## Connection pool best practices
+
+Using a connection pool reduces the overhead of creating and destroying connections for every operation. TDengine recommends using connection pools in all production applications.
+
+<Tip>
+Always return connections to the pool after use. In Java with HikariCP, calling `connection.close()` returns the connection to the pool rather than closing it.
+</Tip>
+
+<CodeGroup>
+
+```java HikariCP example
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+import java.sql.Connection;
+
+HikariConfig config = new HikariConfig();
+config.setJdbcUrl("jdbc:TAOS-WS://localhost:6041/power?user=root&password=taosdata");
+config.setMaximumPoolSize(10);
+config.setMinimumIdle(2);
+config.setConnectionTimeout(30000);
+config.setIdleTimeout(600000);
+config.setMaxLifetime(1800000);
+
+HikariDataSource dataSource = new HikariDataSource(config);
+
+// Use a connection from the pool
+try (Connection conn = dataSource.getConnection()) {
+    // perform database operations
+}
+// connection is returned to the pool automatically
+```
+
+```go connpool/main.go
+package main
+
+import (
+    "database/sql"
+
+    _ "github.com/taosdata/driver-go/v3/taosSql"
+)
+
+func main() {
+    taos, _ := sql.Open("taosSql", "root:taosdata@tcp(localhost:6030)/")
+
+    // SetMaxOpenConns sets the maximum number of open connections (0 = unlimited)
+    taos.SetMaxOpenConns(0)
+    // SetMaxIdleConns sets the maximum number of idle connections in the pool
+    taos.SetMaxIdleConns(2)
+    // SetConnMaxLifetime sets the maximum time a connection may be reused (0 = no limit)
+    taos.SetConnMaxLifetime(0)
+    // SetConnMaxIdleTime sets the maximum time a connection may be idle (0 = no limit)
+    taos.SetConnMaxIdleTime(0)
+}
+```
+
+```rust Rust deadpool example
+use taos::*;
+
+let pool: Pool<TaosBuilder> = TaosBuilder::from_dsn("taos:///")
+    .unwrap()
+    .pool()
+    .unwrap();
+
+// Custom pool size
+let pool: Pool<TaosBuilder> = Pool::builder(
+    Manager::from_dsn("taos:///").unwrap().0
+)
+    .max_size(88)
+    .build()
+    .unwrap();
+
+// Get a connection from the pool
+let taos = pool.get().await?;
+```
+
+</CodeGroup>
